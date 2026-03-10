@@ -20,10 +20,18 @@ async fn main() {
     });
 
     let addr = config.listen.http.clone();
-    let state = AppState::new(config);
+    let state = AppState::new(config.clone());
+
+    // Start SIP bridge in background
+    let bridge_state = state.clone();
+    let bridge_config = config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = xbridge::bridge::run(&bridge_config, bridge_state).await {
+            tracing::error!("SIP bridge error: {e}");
+        }
+    });
 
     tracing::info!("xbridge listening on {addr}");
-
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app(state)).await.unwrap();
 }
