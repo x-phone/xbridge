@@ -1,6 +1,7 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,7 +21,7 @@ use crate::webhook::WebhookEvent;
 use crate::ws::{ClientEvent, MediaFormat, ServerEvent, ServerMediaPayload, StartPayload};
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let api_routes = Router::new()
         .route("/ws/{call_id}", get(ws_handler))
         .route("/v1/calls", get(list_calls).post(create_call))
         .route(
@@ -33,7 +34,47 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/calls/{call_id}/dtmf", post(send_dtmf))
         .route("/v1/calls/{call_id}/mute", post(mute_call))
         .route("/v1/calls/{call_id}/unmute", post(unmute_call))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    Router::new()
+        .route("/health", get(health_check))
+        .merge(api_routes)
         .with_state(state)
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<impl IntoResponse, StatusCode> {
+    let Some(ref expected_key) = state.config.auth.api_key else {
+        // No API key configured — auth disabled
+        return Ok(next.run(req).await);
+    };
+
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) if header.strip_prefix("Bearer ") == Some(expected_key) => {
+            Ok(next.run(req).await)
+        }
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let sip_connected = state.phone.get().is_some();
+    let active_calls = state.calls.read().await.len();
+    let status = if sip_connected { "ok" } else { "starting" };
+
+    Json(serde_json::json!({
+        "status": status,
+        "sip_connected": sip_connected,
+        "active_calls": active_calls,
+    }))
 }
 
 async fn list_calls(State(state): State<AppState>) -> Json<CallListResponse> {
@@ -459,7 +500,7 @@ async fn send_json<T: serde::Serialize>(
 mod tests {
     use super::*;
     use crate::config::{
-        Config, ListenConfig, SipConfig, SipTransport, StreamConfig, WebhookConfig,
+        AuthConfig, Config, ListenConfig, SipConfig, SipTransport, StreamConfig, WebhookConfig,
     };
     use crate::webhook_client::WebhookClient;
     use axum::body::Body;
@@ -488,6 +529,7 @@ mod tests {
                 retry: 1,
             },
             stream: StreamConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 
@@ -524,6 +566,51 @@ mod tests {
             axum::serve(listener, app(state)).await.unwrap();
         });
         format!("127.0.0.1:{}", addr.port())
+    }
+
+    // ── GET /health ──
+
+    #[tokio::test]
+    async fn health_returns_starting_when_phone_not_connected() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = body_json(resp).await;
+        assert_eq!(body["status"], "starting");
+        assert_eq!(body["sip_connected"], false);
+        assert_eq!(body["active_calls"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_reports_active_call_count() {
+        let state = test_state();
+        state
+            .calls
+            .write()
+            .await
+            .insert("call_001".into(), sample_call("call_001"));
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = body_json(resp).await;
+        assert_eq!(body["active_calls"], 1);
     }
 
     // ── GET /v1/calls ──
@@ -796,5 +883,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Auth middleware ──
+
+    fn test_state_with_auth(api_key: &str) -> AppState {
+        let mut config = test_config();
+        config.auth = AuthConfig {
+            api_key: Some(api_key.into()),
+        };
+        let webhook = WebhookClient::new(&config.webhook);
+        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
+        let (state_tx, _) = tokio::sync::mpsc::channel(32);
+        AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx)
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_without_header() {
+        let state = test_state_with_auth("secret-key");
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/calls")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_wrong_key() {
+        let state = test_state_with_auth("secret-key");
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/calls")
+                    .header("authorization", "Bearer wrong-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_accepts_correct_key() {
+        let state = test_state_with_auth("secret-key");
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/calls")
+                    .header("authorization", "Bearer secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_does_not_protect_health() {
+        let state = test_state_with_auth("secret-key");
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_auth_config_allows_all() {
+        // Default test_state has no api_key — all requests pass
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/calls")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

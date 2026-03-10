@@ -45,6 +45,8 @@ pub struct Config {
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub stream: StreamConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -140,6 +142,12 @@ fn default_encoding() -> AudioEncoding {
     AudioEncoding::Mulaw
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AuthConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
 fn default_sample_rate() -> u32 {
     8000
 }
@@ -168,6 +176,7 @@ impl Default for Config {
                 retry: default_retry(),
             },
             stream: StreamConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -302,6 +311,11 @@ impl Config {
             if let Ok(n) = v.parse() {
                 config.stream.sample_rate = n;
             }
+        }
+
+        // Auth
+        if let Ok(v) = get_var("XBRIDGE_AUTH_API_KEY") {
+            config.auth.api_key = Some(v);
         }
     }
 }
