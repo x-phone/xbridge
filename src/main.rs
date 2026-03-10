@@ -41,12 +41,34 @@ async fn main() {
     });
 
     tracing::info!("xbridge listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app(state))
+    serve(&config, app(state), &addr).await;
+    tracing::info!("xbridge shut down");
+}
+
+async fn serve(config: &Config, router: axum::Router, addr: &str) {
+    #[cfg(feature = "tls")]
+    if let (Some(cert), Some(key)) = (&config.tls.cert, &config.tls.key) {
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("failed to load TLS certs: {e}");
+                std::process::exit(1);
+            });
+        tracing::info!("TLS enabled");
+        let addr: std::net::SocketAddr = addr.parse().unwrap();
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(router.into_make_service())
+            .await
+            .unwrap();
+        return;
+    }
+
+    let _ = config;
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
-    tracing::info!("xbridge shut down");
 }
 
 async fn shutdown_signal() {

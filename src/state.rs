@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::call::CallInfo;
 use crate::config::Config;
+use crate::metrics::Metrics;
 use crate::webhook_client::WebhookClient;
 
 pub type CallRegistry = Arc<RwLock<HashMap<String, CallInfo>>>;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub(crate) state_tx: mpsc::Sender<(String, xphone::CallState)>,
     pub(crate) webhook: WebhookClient,
     pub(crate) config: Arc<Config>,
+    pub(crate) metrics: Metrics,
 }
 
 impl AppState {
@@ -38,6 +40,7 @@ impl AppState {
             state_tx,
             webhook,
             config: Arc::new(config),
+            metrics: Metrics::new(),
         }
     }
 }

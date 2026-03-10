@@ -183,6 +183,9 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
                 status: CallStatus::InProgress,
             };
 
+            state.metrics.inc_calls_total();
+            state.metrics.inc_calls_inbound();
+
             state.calls.write().await.insert(call_id.clone(), info);
             state
                 .xphone_calls

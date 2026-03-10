@@ -3,6 +3,7 @@ pub mod audio;
 pub mod bridge;
 pub mod call;
 pub mod config;
+pub mod metrics;
 pub mod router;
 pub mod state;
 pub mod webhook;

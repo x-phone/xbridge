@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::api::{
     CallListResponse, CreateCallRequest, CreateCallResponse, DtmfRequest, TransferRequest,
@@ -21,6 +22,12 @@ use crate::webhook::WebhookEvent;
 use crate::ws::{ClientEvent, MediaFormat, ServerEvent, ServerMediaPayload, StartPayload};
 
 pub fn app(state: AppState) -> Router {
+    let rate_limiter = state
+        .config
+        .rate_limit
+        .requests_per_second
+        .map(RateLimiter::new);
+
     let api_routes = Router::new()
         .route("/ws/{call_id}", get(ws_handler))
         .route("/v1/calls", get(list_calls).post(create_call))
@@ -34,12 +41,71 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/calls/{call_id}/dtmf", post(send_dtmf))
         .route("/v1/calls/{call_id}/mute", post(mute_call))
         .route("/v1/calls/{call_id}/unmute", post(unmute_call))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ));
 
     Router::new()
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
         .merge(api_routes)
         .with_state(state)
+}
+
+#[derive(Clone)]
+struct RateLimiter {
+    inner: Arc<std::sync::Mutex<TokenBucket>>,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    max_tokens: f64,
+    refill_rate: f64, // tokens per second
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    fn new(rps: u32) -> Self {
+        let max_tokens = rps as f64 * 2.0; // burst = 2x rate
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(TokenBucket {
+                tokens: max_tokens,
+                max_tokens,
+                refill_rate: rps as f64,
+                last_refill: Instant::now(),
+            })),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        let mut bucket = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * bucket.refill_rate).min(bucket.max_tokens);
+        bucket.last_refill = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+async fn rate_limit_middleware(
+    State(limiter): State<Option<RateLimiter>>,
+    req: Request,
+    next: Next,
+) -> Result<impl IntoResponse, StatusCode> {
+    if let Some(ref limiter) = limiter {
+        if !limiter.try_acquire() {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 async fn auth_middleware(
@@ -75,6 +141,18 @@ async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> 
         "sip_connected": sip_connected,
         "active_calls": active_calls,
     }))
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let active_calls = state.calls.read().await.len();
+    let body = state.metrics.render(active_calls);
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 async fn list_calls(State(state): State<AppState>) -> Json<CallListResponse> {
@@ -160,6 +238,9 @@ async fn create_call(
         .write()
         .await
         .insert(call_id.clone(), call.clone());
+
+    state.metrics.inc_calls_total();
+    state.metrics.inc_calls_outbound();
 
     // Wire callbacks
     bridge::wire_call_callbacks(&call, &call_id, &state);
@@ -334,9 +415,10 @@ async fn ws_handler(
 
     let encoding = state.config.stream.encoding.clone();
     let sample_rate = state.config.stream.sample_rate;
+    let metrics = state.metrics.clone();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_ws(socket, call_id, call, encoding, sample_rate)
+        handle_ws(socket, call_id, call, encoding, sample_rate, metrics)
     }))
 }
 
@@ -346,7 +428,9 @@ async fn handle_ws(
     call: Arc<xphone::Call>,
     encoding: AudioEncoding,
     sample_rate: u32,
+    metrics: crate::metrics::Metrics,
 ) {
+    metrics.inc_ws_connections();
     let encoding_str = match encoding {
         AudioEncoding::Mulaw => "audio/x-mulaw",
         AudioEncoding::L16 => "audio/x-l16",
@@ -486,6 +570,7 @@ async fn handle_ws(
         _ = &mut sender_handle => { reader_handle.abort(); receiver_handle.abort(); },
         _ = &mut receiver_handle => { reader_handle.abort(); sender_handle.abort(); },
     }
+    metrics.dec_ws_connections();
 }
 
 async fn send_json<T: serde::Serialize>(
@@ -530,6 +615,8 @@ mod tests {
             },
             stream: StreamConfig::default(),
             auth: AuthConfig::default(),
+            tls: crate::config::TlsConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
         }
     }
 
@@ -611,6 +698,30 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = body_json(resp).await;
         assert_eq!(body["active_calls"], 1);
+    }
+
+    // ── GET /metrics ──
+
+    #[tokio::test]
+    async fn metrics_returns_prometheus_format() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/plain"));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("xbridge_active_calls"));
+        assert!(body.contains("xbridge_calls_total"));
+        assert!(body.contains("xbridge_ws_connections"));
     }
 
     // ── GET /v1/calls ──
@@ -978,6 +1089,104 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Rate limiting ──
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let limiter = RateLimiter::new(100);
+        for _ in 0..100 {
+            assert!(limiter.try_acquire());
+        }
+    }
+
+    #[test]
+    fn rate_limiter_rejects_over_burst() {
+        let limiter = RateLimiter::new(10);
+        // Burst is 2x rate = 20 tokens
+        for _ in 0..20 {
+            assert!(limiter.try_acquire());
+        }
+        assert!(!limiter.try_acquire());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429() {
+        let mut config = test_config();
+        config.rate_limit.requests_per_second = Some(1); // 1 rps, burst = 2
+        let webhook = WebhookClient::new(&config.webhook);
+        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
+        let (state_tx, _) = tokio::sync::mpsc::channel(32);
+        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+
+        let router = app(state);
+
+        // First 2 requests should succeed (burst = 2)
+        for _ in 0..2 {
+            let resp = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/calls")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Third should be rate limited
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/calls")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_does_not_affect_health() {
+        let mut config = test_config();
+        config.rate_limit.requests_per_second = Some(1);
+        let webhook = WebhookClient::new(&config.webhook);
+        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
+        let (state_tx, _) = tokio::sync::mpsc::channel(32);
+        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+
+        let router = app(state);
+
+        // Exhaust rate limit
+        for _ in 0..3 {
+            let _ = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/calls")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+        }
+
+        // Health should still work
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }

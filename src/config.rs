@@ -47,6 +47,10 @@ pub struct Config {
     pub stream: StreamConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,6 +152,20 @@ pub struct AuthConfig {
     pub api_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub requests_per_second: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TlsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
 fn default_sample_rate() -> u32 {
     8000
 }
@@ -177,6 +195,8 @@ impl Default for Config {
             },
             stream: StreamConfig::default(),
             auth: AuthConfig::default(),
+            tls: TlsConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -316,6 +336,21 @@ impl Config {
         // Auth
         if let Ok(v) = get_var("XBRIDGE_AUTH_API_KEY") {
             config.auth.api_key = Some(v);
+        }
+
+        // Rate limit
+        if let Ok(v) = get_var("XBRIDGE_RATE_LIMIT_RPS") {
+            if let Ok(n) = v.parse() {
+                config.rate_limit.requests_per_second = Some(n);
+            }
+        }
+
+        // TLS
+        if let Ok(v) = get_var("XBRIDGE_TLS_CERT") {
+            config.tls.cert = Some(v);
+        }
+        if let Ok(v) = get_var("XBRIDGE_TLS_KEY") {
+            config.tls.key = Some(v);
         }
     }
 }
