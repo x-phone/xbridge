@@ -1,0 +1,54 @@
+account:
+  type: organization
+  name: x-phone
+
+defaults:
+  visibility: public
+  default_branch: main
+  delete_branch_on_merge: true
+
+repos:
+  - name: xbridge
+    description: "Self-hosted voice gateway — WebSocket audio streaming and REST call control. Drop-in Twilio replacement powered by xphone."
+    topics:
+      - rust
+      - telephony
+      - sip
+      - voip
+      - websocket
+      - voice-agent
+      - ai-voice
+      - twilio
+      - twilio-alternative
+      - rtp
+      - speech-to-text
+      - text-to-speech
+    homepage: ""
+    visibility: public
+    ci: rust
+
+labels:
+  replace_defaults: true
+  list:
+    - name: bug
+      color: d73a4a
+      description: Something isn't working
+    - name: enhancement
+      color: a2eeef
+      description: New feature or request
+    - name: documentation
+      color: 0075ca
+      description: Improvements or additions to documentation
+    - name: good first issue
+      color: 7057ff
+      description: Good for newcomers
+    - name: security
+      color: e4e669
+      description: Security related
+
+branch_protection:
+  preset: basic
+
+security:
+  dependabot: true
+  secret_scanning: true
