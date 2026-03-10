@@ -73,7 +73,9 @@ async fn handle_ws(_socket: WebSocket, _state: AppState, _call_id: String) {
 mod tests {
     use super::*;
     use crate::call::{CallDirection, CallStatus};
-    use crate::config::*;
+    use crate::config::{
+        Config, ListenConfig, SipConfig, SipTransport, StreamConfig, WebhookConfig,
+    };
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tokio::net::TcpListener;

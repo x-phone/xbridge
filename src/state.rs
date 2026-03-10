@@ -8,9 +8,10 @@ use crate::config::Config;
 pub type CallRegistry = Arc<RwLock<HashMap<String, CallInfo>>>;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct AppState {
-    pub calls: CallRegistry,
-    pub config: Arc<Config>,
+    pub(crate) calls: CallRegistry,
+    pub(crate) config: Arc<Config>,
 }
 
 impl AppState {

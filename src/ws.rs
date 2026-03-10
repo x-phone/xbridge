@@ -94,13 +94,13 @@ pub struct MarkPayload {
 
 pub const NATIVE_AUDIO_TAG: u8 = 0x01;
 
-pub fn encode_native_audio(pcm_data: &[u8]) -> Vec<u8> {
-    let len = pcm_data.len() as u16;
+pub fn encode_native_audio(pcm_data: &[u8]) -> Option<Vec<u8>> {
+    let len: u16 = pcm_data.len().try_into().ok()?;
     let mut frame = Vec::with_capacity(3 + pcm_data.len());
     frame.push(NATIVE_AUDIO_TAG);
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(pcm_data);
-    frame
+    Some(frame)
 }
 
 pub fn decode_native_audio(frame: &[u8]) -> Option<&[u8]> {
@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn native_audio_encode_decode_roundtrip() {
         let pcm = vec![0x01, 0x02, 0x03, 0x04];
-        let frame = encode_native_audio(&pcm);
+        let frame = encode_native_audio(&pcm).unwrap();
 
         assert_eq!(frame[0], NATIVE_AUDIO_TAG);
         assert_eq!(u16::from_be_bytes([frame[1], frame[2]]), 4);
@@ -261,10 +261,16 @@ mod tests {
 
     #[test]
     fn native_audio_empty_payload() {
-        let frame = encode_native_audio(&[]);
+        let frame = encode_native_audio(&[]).unwrap();
         assert_eq!(frame.len(), 3);
         let decoded = decode_native_audio(&frame).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn native_audio_encode_rejects_oversized_payload() {
+        let oversized = vec![0u8; u16::MAX as usize + 1];
+        assert!(encode_native_audio(&oversized).is_none());
     }
 
     #[test]

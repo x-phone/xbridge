@@ -17,6 +17,7 @@ pub struct ListenConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SipConfig {
     pub username: String,
+    #[serde(skip_serializing)]
     pub password: String,
     pub host: String,
     #[serde(default = "default_transport")]
@@ -73,7 +74,7 @@ pub struct StreamConfig {
     #[serde(default = "default_stream_mode")]
     pub mode: StreamMode,
     #[serde(default = "default_encoding")]
-    pub encoding: String,
+    pub encoding: AudioEncoding,
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
 }
@@ -89,8 +90,16 @@ fn default_stream_mode() -> StreamMode {
     StreamMode::Twilio
 }
 
-fn default_encoding() -> String {
-    "audio/x-mulaw".into()
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AudioEncoding {
+    #[serde(rename = "audio/x-mulaw")]
+    Mulaw,
+    #[serde(rename = "audio/x-l16")]
+    L16,
+}
+
+fn default_encoding() -> AudioEncoding {
+    AudioEncoding::Mulaw
 }
 
 fn default_sample_rate() -> u32 {
@@ -127,7 +136,7 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             mode: default_stream_mode(),
-            encoding: default_encoding(),
+            encoding: AudioEncoding::Mulaw,
             sample_rate: default_sample_rate(),
         }
     }
@@ -180,11 +189,12 @@ mod tests {
         );
         assert_eq!(config.webhook.url, "https://your-app.com/events");
         assert_eq!(config.stream.mode, StreamMode::Twilio);
-        assert_eq!(config.stream.encoding, "audio/x-mulaw");
+        assert_eq!(config.stream.encoding, AudioEncoding::Mulaw);
         assert_eq!(config.stream.sample_rate, 8000);
 
+        // password is excluded from serialization
         let back = serde_json::to_value(&config).unwrap();
-        assert_eq!(json, back);
+        assert!(back["sip"].get("password").is_none());
     }
 
     #[test]
@@ -215,7 +225,7 @@ mod tests {
 
         // Stream defaults
         assert_eq!(config.stream.mode, StreamMode::Twilio);
-        assert_eq!(config.stream.encoding, "audio/x-mulaw");
+        assert_eq!(config.stream.encoding, AudioEncoding::Mulaw);
         assert_eq!(config.stream.sample_rate, 8000);
     }
 
