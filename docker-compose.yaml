@@ -1,0 +1,14 @@
+services:
+  xbridge:
+    build: .
+    ports:
+      - "8080:8080"
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - ./config.yaml:/etc/xbridge/config.yaml:ro
+    environment:
+      - RUST_LOG=info
+      # Override config values via env vars:
+      # - XBRIDGE_SIP_PASSWORD=secret
+      # - XBRIDGE_AUTH_API_KEY=your-api-key
+    restart: unless-stopped

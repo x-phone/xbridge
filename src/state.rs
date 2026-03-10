@@ -13,9 +13,9 @@ pub type PhoneRegistry = Arc<RwLock<HashMap<String, xphone::Phone>>>;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub(crate) calls: CallRegistry,
+    pub calls: CallRegistry,
     pub(crate) xphone_calls: XphoneCallRegistry,
-    pub(crate) phones: PhoneRegistry,
+    pub phones: PhoneRegistry,
     pub(crate) ended_tx: mpsc::Sender<(String, xphone::EndReason, std::time::Duration)>,
     pub(crate) dtmf_tx: mpsc::Sender<(String, String)>,
     pub(crate) state_tx: mpsc::Sender<(String, xphone::CallState)>,

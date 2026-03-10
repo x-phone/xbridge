@@ -1,0 +1,46 @@
+listen:
+  http: "0.0.0.0:8080"
+
+# Single trunk (simple setup)
+sip:
+  username: "1001"
+  password: "your-sip-password"
+  host: "sip.your-provider.com"
+  transport: "udp"        # udp | tcp | tls
+  rtp_port_min: 10000
+  rtp_port_max: 20000
+  srtp: false
+  # stun_server: "stun.l.google.com:19302"
+
+# Multi-trunk setup (overrides sip block above)
+# trunks:
+#   - name: "telnyx"
+#     username: "1001"
+#     password: "secret1"
+#     host: "sip.telnyx.com"
+#     transport: "tls"
+#     srtp: true
+#   - name: "twilio"
+#     username: "2001"
+#     password: "secret2"
+#     host: "sip.twilio.com"
+
+webhook:
+  url: "http://localhost:3000/events"
+  timeout: "5s"
+  retry: 1
+
+stream:
+  mode: "twilio"          # twilio | native
+  encoding: "audio/x-mulaw"  # audio/x-mulaw | audio/x-l16
+  sample_rate: 8000
+
+# auth:
+#   api_key: "your-secret-api-key"
+
+# tls:
+#   cert: "/path/to/cert.pem"
+#   key: "/path/to/key.pem"
+
+# rate_limit:
+#   requests_per_second: 100

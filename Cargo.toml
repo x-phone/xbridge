@@ -31,3 +31,4 @@ tls = ["axum-server"]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.28"
+reqwest = { version = "0.12", features = ["json"] }
