@@ -169,12 +169,10 @@ async fn hold_call(
     if let Some(info) = state.calls.write().await.get_mut(&call_id) {
         info.status = CallStatus::OnHold;
     }
-    state
-        .webhook
-        .send_event(&WebhookEvent::Hold {
-            call_id,
-        })
-        .await;
+    let webhook = state.webhook.clone();
+    tokio::spawn(async move {
+        webhook.send_event(&WebhookEvent::Hold { call_id }).await;
+    });
 
     StatusCode::OK
 }
@@ -196,12 +194,12 @@ async fn resume_call(
     if let Some(info) = state.calls.write().await.get_mut(&call_id) {
         info.status = CallStatus::InProgress;
     }
-    state
-        .webhook
-        .send_event(&WebhookEvent::Resumed {
-            call_id,
-        })
-        .await;
+    let webhook = state.webhook.clone();
+    tokio::spawn(async move {
+        webhook
+            .send_event(&WebhookEvent::Resumed { call_id })
+            .await;
+    });
 
     StatusCode::OK
 }
@@ -234,14 +232,22 @@ async fn send_dtmf(
         Err(s) => return s,
     };
 
-    for digit in req.digits.chars() {
-        if let Err(e) = call.send_dtmf(&digit.to_string()) {
-            tracing::error!("dtmf send failed for {call_id}: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR;
+    let result = tokio::task::spawn_blocking(move || {
+        for digit in req.digits.chars() {
+            call.send_dtmf(&digit.to_string())?;
         }
-    }
+        Ok::<(), xphone::Error>(())
+    })
+    .await;
 
-    StatusCode::OK
+    match result {
+        Ok(Ok(())) => StatusCode::OK,
+        Ok(Err(e)) => {
+            tracing::error!("dtmf send failed for {call_id}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 async fn mute_call(
@@ -283,10 +289,7 @@ async fn ws_handler(
     Path(call_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Verify call exists and get the xphone Call
-    let xphone_calls = state.xphone_calls.read().await;
-    let call = xphone_calls.get(&call_id).cloned().ok_or(StatusCode::NOT_FOUND)?;
-    drop(xphone_calls);
+    let call = get_xphone_call(&state, &call_id).await?;
 
     let encoding = state.config.stream.encoding.clone();
     let sample_rate = state.config.stream.sample_rate;
@@ -493,7 +496,8 @@ mod tests {
         let webhook = WebhookClient::new(&config.webhook);
         let (ended_tx, _ended_rx) = tokio::sync::mpsc::channel(32);
         let (dtmf_tx, _dtmf_rx) = tokio::sync::mpsc::channel(32);
-        AppState::new(config, webhook, ended_tx, dtmf_tx)
+        let (state_tx, _state_rx) = tokio::sync::mpsc::channel(32);
+        AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx)
     }
 
     fn sample_call(id: &str) -> CallInfo {

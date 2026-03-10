@@ -16,6 +16,7 @@ pub struct AppState {
     pub(crate) phone: Arc<OnceLock<xphone::Phone>>,
     pub(crate) ended_tx: mpsc::Sender<(String, xphone::EndReason, std::time::Duration)>,
     pub(crate) dtmf_tx: mpsc::Sender<(String, String)>,
+    pub(crate) state_tx: mpsc::Sender<(String, xphone::CallState)>,
     pub(crate) webhook: WebhookClient,
     pub(crate) config: Arc<Config>,
 }
@@ -26,6 +27,7 @@ impl AppState {
         webhook: WebhookClient,
         ended_tx: mpsc::Sender<(String, xphone::EndReason, std::time::Duration)>,
         dtmf_tx: mpsc::Sender<(String, String)>,
+        state_tx: mpsc::Sender<(String, xphone::CallState)>,
     ) -> Self {
         Self {
             calls: Arc::new(RwLock::new(HashMap::new())),
@@ -33,6 +35,7 @@ impl AppState {
             phone: Arc::new(OnceLock::new()),
             ended_tx,
             dtmf_tx,
+            state_tx,
             webhook,
             config: Arc::new(config),
         }

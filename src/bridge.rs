@@ -13,6 +13,7 @@ pub async fn run(
     state: AppState,
     mut ended_rx: mpsc::Receiver<(String, xphone::EndReason, std::time::Duration)>,
     mut dtmf_rx: mpsc::Receiver<(String, String)>,
+    mut state_rx: mpsc::Receiver<(String, xphone::CallState)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let xphone_config = build_xphone_config(config);
     let phone = xphone::Phone::new(xphone_config);
@@ -75,6 +76,60 @@ pub async fn run(
                 .webhook
                 .send_event(&WebhookEvent::Dtmf { call_id, digit })
                 .await;
+        }
+    });
+
+    // Spawn outbound call-state transition task
+    let state_state = state.clone();
+    tokio::spawn(async move {
+        while let Some((call_id, new_state)) = state_rx.recv().await {
+            match new_state {
+                xphone::CallState::RemoteRinging => {
+                    let (from, to) = {
+                        let mut calls = state_state.calls.write().await;
+                        if let Some(info) = calls.get_mut(&call_id) {
+                            info.status = CallStatus::Ringing;
+                            (info.from.clone(), info.to.clone())
+                        } else {
+                            continue;
+                        }
+                    };
+                    state_state
+                        .webhook
+                        .send_event(&WebhookEvent::Ringing {
+                            call_id,
+                            from,
+                            to,
+                        })
+                        .await;
+                }
+                xphone::CallState::Active => {
+                    // Only send Answered on the initial answer (Dialing/Ringing → Active).
+                    // Resume from hold triggers Active too, but REST handler sends Resumed.
+                    let should_notify = {
+                        let mut calls = state_state.calls.write().await;
+                        if let Some(info) = calls.get_mut(&call_id) {
+                            if info.status == CallStatus::Dialing
+                                || info.status == CallStatus::Ringing
+                            {
+                                info.status = CallStatus::InProgress;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if should_notify {
+                        state_state
+                            .webhook
+                            .send_event(&WebhookEvent::Answered { call_id })
+                            .await;
+                    }
+                }
+                _ => {}
+            }
         }
     });
 
@@ -188,55 +243,9 @@ pub(crate) fn wire_outbound_state_callbacks(
     state: &AppState,
 ) {
     let cid = call_id.to_string();
-    let state = state.clone();
-    let from = call.from();
-    let to = call.to();
+    let state_tx = state.state_tx.clone();
     call.on_state(move |new_state: xphone::CallState| {
-        let cid = cid.clone();
-        let state = state.clone();
-        let from = from.clone();
-        let to = to.clone();
-        // Use a separate tokio task for async webhook delivery
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                match new_state {
-                    xphone::CallState::RemoteRinging => {
-                        // Update status to ringing
-                        if let Some(info) = state.calls.write().await.get_mut(&cid) {
-                            info.status = CallStatus::Ringing;
-                        }
-                        state
-                            .webhook
-                            .send_event(&WebhookEvent::Ringing {
-                                call_id: cid,
-                                from,
-                                to,
-                            })
-                            .await;
-                    }
-                    xphone::CallState::Active => {
-                        // Update status to in_progress
-                        if let Some(info) = state.calls.write().await.get_mut(&cid) {
-                            info.status = CallStatus::InProgress;
-                        }
-                        state
-                            .webhook
-                            .send_event(&WebhookEvent::Answered { call_id: cid })
-                            .await;
-                    }
-                    xphone::CallState::OnHold => {
-                        if let Some(info) = state.calls.write().await.get_mut(&cid) {
-                            info.status = CallStatus::OnHold;
-                        }
-                        state
-                            .webhook
-                            .send_event(&WebhookEvent::Hold { call_id: cid })
-                            .await;
-                    }
-                    _ => {}
-                }
-            });
-        });
+        let _ = state_tx.blocking_send((cid.clone(), new_state));
     });
 }
 

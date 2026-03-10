@@ -25,15 +25,16 @@ async fn main() {
 
     let (ended_tx, ended_rx) = tokio::sync::mpsc::channel(32);
     let (dtmf_tx, dtmf_rx) = tokio::sync::mpsc::channel(32);
+    let (state_tx, state_rx) = tokio::sync::mpsc::channel(32);
 
-    let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx);
+    let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx, state_tx);
 
     // Start SIP bridge in background
     let bridge_state = state.clone();
     let bridge_config = config.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            xbridge::bridge::run(&bridge_config, bridge_state, ended_rx, dtmf_rx).await
+            xbridge::bridge::run(&bridge_config, bridge_state, ended_rx, dtmf_rx, state_rx).await
         {
             tracing::error!("SIP bridge error: {e}");
         }
