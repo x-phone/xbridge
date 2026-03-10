@@ -1,3 +1,4 @@
+use std::path::Path;
 use tracing_subscriber::EnvFilter;
 use xbridge::config::Config;
 use xbridge::router::app;
@@ -9,8 +10,15 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // TODO: load config from file / env
-    let config = Config::default();
+    let config_path = std::env::args()
+        .skip_while(|a| a != "--config")
+        .nth(1);
+
+    let config = Config::load(config_path.as_deref().map(Path::new)).unwrap_or_else(|e| {
+        eprintln!("failed to load config: {e}");
+        std::process::exit(1);
+    });
+
     let addr = config.listen.http.clone();
     let state = AppState::new(config);
 
