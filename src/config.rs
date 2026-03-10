@@ -97,6 +97,32 @@ fn default_sample_rate() -> u32 {
     8000
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen: ListenConfig {
+                http: "0.0.0.0:8080".into(),
+            },
+            sip: SipConfig {
+                username: String::new(),
+                password: String::new(),
+                host: "localhost".into(),
+                transport: default_transport(),
+                rtp_port_min: default_rtp_port_min(),
+                rtp_port_max: default_rtp_port_max(),
+                srtp: false,
+                stun_server: None,
+            },
+            webhook: WebhookConfig {
+                url: "http://localhost:3000/events".into(),
+                timeout: default_timeout(),
+                retry: default_retry(),
+            },
+            stream: StreamConfig::default(),
+        }
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
