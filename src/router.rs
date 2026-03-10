@@ -1,28 +1,38 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
-use crate::api::CallListResponse;
+use crate::api::{
+    CallListResponse, CreateCallRequest, CreateCallResponse, DtmfRequest, TransferRequest,
+};
 use crate::audio;
-use crate::call::CallInfo;
+use crate::bridge;
+use crate::call::{CallDirection, CallInfo, CallStatus};
 use crate::config::AudioEncoding;
 use crate::state::AppState;
-use crate::ws::{ClientEvent, ServerEvent, ServerMediaPayload, StartPayload, MediaFormat};
+use crate::webhook::WebhookEvent;
+use crate::ws::{ClientEvent, MediaFormat, ServerEvent, ServerMediaPayload, StartPayload};
 
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/ws/{call_id}", get(ws_handler))
-        .route("/v1/calls", get(list_calls))
+        .route("/v1/calls", get(list_calls).post(create_call))
         .route(
             "/v1/calls/{call_id}",
             get(get_call).delete(hangup_call),
         )
+        .route("/v1/calls/{call_id}/hold", post(hold_call))
+        .route("/v1/calls/{call_id}/resume", post(resume_call))
+        .route("/v1/calls/{call_id}/transfer", post(transfer_call))
+        .route("/v1/calls/{call_id}/dtmf", post(send_dtmf))
+        .route("/v1/calls/{call_id}/mute", post(mute_call))
+        .route("/v1/calls/{call_id}/unmute", post(unmute_call))
         .with_state(state)
 }
 
@@ -61,6 +71,211 @@ async fn hangup_call(
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+async fn create_call(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateCallRequest>,
+) -> Result<Json<CreateCallResponse>, StatusCode> {
+    if state.phone.get().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let from = req.from.clone();
+    let to = req.to.clone();
+
+    let opts = xphone::DialOptions {
+        caller_id: Some(from.clone()),
+        ..Default::default()
+    };
+
+    // Phone::dial is blocking
+    let phone_ref = state.phone.clone();
+    let call = tokio::task::spawn_blocking(move || {
+        let phone = phone_ref.get().ok_or(xphone::Error::NotConnected)?;
+        phone.dial(&to, opts)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| {
+        tracing::error!("dial failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let call_id = call.id();
+
+    let info = CallInfo {
+        call_id: call_id.clone(),
+        from,
+        to: req.to.clone(),
+        direction: CallDirection::Outbound,
+        status: CallStatus::Dialing,
+    };
+
+    state.calls.write().await.insert(call_id.clone(), info);
+    state
+        .xphone_calls
+        .write()
+        .await
+        .insert(call_id.clone(), call.clone());
+
+    // Wire callbacks
+    bridge::wire_call_callbacks(&call, &call_id, &state);
+    bridge::wire_outbound_state_callbacks(&call, &call_id, &state);
+
+    // Build ws_url from Host header or config
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(state.config.listen.http.as_str());
+    let ws_url = format!("ws://{host}/ws/{call_id}");
+
+    Ok(Json(CreateCallResponse {
+        call_id,
+        status: CallStatus::Dialing,
+        ws_url,
+    }))
+}
+
+/// Helper to look up the xphone Call by ID.
+async fn get_xphone_call(
+    state: &AppState,
+    call_id: &str,
+) -> Result<Arc<xphone::Call>, StatusCode> {
+    state
+        .xphone_calls
+        .read()
+        .await
+        .get(call_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn hold_call(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+) -> StatusCode {
+    let call = match get_xphone_call(&state, &call_id).await {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+
+    if let Err(e) = call.hold() {
+        tracing::error!("hold failed for {call_id}: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    if let Some(info) = state.calls.write().await.get_mut(&call_id) {
+        info.status = CallStatus::OnHold;
+    }
+    state
+        .webhook
+        .send_event(&WebhookEvent::Hold {
+            call_id,
+        })
+        .await;
+
+    StatusCode::OK
+}
+
+async fn resume_call(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+) -> StatusCode {
+    let call = match get_xphone_call(&state, &call_id).await {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+
+    if let Err(e) = call.resume() {
+        tracing::error!("resume failed for {call_id}: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    if let Some(info) = state.calls.write().await.get_mut(&call_id) {
+        info.status = CallStatus::InProgress;
+    }
+    state
+        .webhook
+        .send_event(&WebhookEvent::Resumed {
+            call_id,
+        })
+        .await;
+
+    StatusCode::OK
+}
+
+async fn transfer_call(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+    Json(req): Json<TransferRequest>,
+) -> StatusCode {
+    let call = match get_xphone_call(&state, &call_id).await {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+
+    if let Err(e) = call.blind_transfer(&req.target) {
+        tracing::error!("transfer failed for {call_id}: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    StatusCode::OK
+}
+
+async fn send_dtmf(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+    Json(req): Json<DtmfRequest>,
+) -> StatusCode {
+    let call = match get_xphone_call(&state, &call_id).await {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+
+    for digit in req.digits.chars() {
+        if let Err(e) = call.send_dtmf(&digit.to_string()) {
+            tracing::error!("dtmf send failed for {call_id}: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    StatusCode::OK
+}
+
+async fn mute_call(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+) -> StatusCode {
+    let call = match get_xphone_call(&state, &call_id).await {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+
+    if let Err(e) = call.mute() {
+        tracing::error!("mute failed for {call_id}: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    StatusCode::OK
+}
+
+async fn unmute_call(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+) -> StatusCode {
+    let call = match get_xphone_call(&state, &call_id).await {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+
+    if let Err(e) = call.unmute() {
+        tracing::error!("unmute failed for {call_id}: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    StatusCode::OK
 }
 
 async fn ws_handler(
@@ -240,10 +455,10 @@ async fn send_json<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::call::{CallDirection, CallStatus};
     use crate::config::{
         Config, ListenConfig, SipConfig, SipTransport, StreamConfig, WebhookConfig,
     };
+    use crate::webhook_client::WebhookClient;
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tokio::net::TcpListener;
@@ -274,7 +489,11 @@ mod tests {
     }
 
     fn test_state() -> AppState {
-        AppState::new(test_config())
+        let config = test_config();
+        let webhook = WebhookClient::new(&config.webhook);
+        let (ended_tx, _ended_rx) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _dtmf_rx) = tokio::sync::mpsc::channel(32);
+        AppState::new(config, webhook, ended_tx, dtmf_tx)
     }
 
     fn sample_call(id: &str) -> CallInfo {
@@ -449,5 +668,129 @@ mod tests {
             }
             other => panic!("expected HTTP 404 error, got: {other}"),
         }
+    }
+
+    // ── POST /v1/calls (outbound) ──
+    // Requires a connected xphone::Phone which we can't create in unit tests.
+    // Test the 503 case (phone not connected).
+
+    #[tokio::test]
+    async fn create_call_returns_503_when_not_connected() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"to":"+15551234567","from":"+15559876543"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── Call control endpoints ──
+    // These need xphone::Call objects; test 404 behavior only.
+
+    #[tokio::test]
+    async fn hold_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/hold")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn resume_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/resume")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn transfer_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/transfer")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"target":"sip:1003@pbx"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dtmf_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/dtmf")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"digits":"1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mute_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/mute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unmute_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/unmute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

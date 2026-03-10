@@ -6,24 +6,19 @@ use crate::call::{CallDirection, CallInfo, CallStatus};
 use crate::config::Config;
 use crate::state::AppState;
 use crate::webhook::WebhookEvent;
-use crate::webhook_client::WebhookClient;
 
 /// Start the SIP bridge: register with the trunk, handle incoming calls.
-pub async fn run(config: &Config, state: AppState) -> Result<(), Box<dyn std::error::Error>> {
-    let webhook = WebhookClient::new(&config.webhook);
-
+pub async fn run(
+    config: &Config,
+    state: AppState,
+    mut ended_rx: mpsc::Receiver<(String, xphone::EndReason, std::time::Duration)>,
+    mut dtmf_rx: mpsc::Receiver<(String, String)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let xphone_config = build_xphone_config(config);
     let phone = xphone::Phone::new(xphone_config);
 
     // Channel for incoming calls (sync callback → async handler)
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<Arc<xphone::Call>>(32);
-
-    // Channel for call-ended events (sync callback → async cleanup)
-    let (ended_tx, mut ended_rx) =
-        mpsc::channel::<(String, xphone::EndReason, std::time::Duration)>(32);
-
-    // Channel for DTMF events (sync callback → async webhook)
-    let (dtmf_tx, mut dtmf_rx) = mpsc::channel::<(String, String)>(32);
 
     phone.on_registered(|| {
         tracing::info!("SIP registration successful");
@@ -49,28 +44,20 @@ pub async fn run(config: &Config, state: AppState) -> Result<(), Box<dyn std::er
         .await??
     };
 
-    // Keep phone alive for the lifetime of the bridge
-    let _phone = phone;
+    // Store phone in state for outbound dialing
+    let _ = state.phone.set(phone);
 
     // Spawn call-ended cleanup task
     let ended_state = state.clone();
-    let ended_webhook = webhook.clone();
     tokio::spawn(async move {
         while let Some((call_id, reason, duration)) = ended_rx.recv().await {
             ended_state.calls.write().await.remove(&call_id);
             ended_state.xphone_calls.write().await.remove(&call_id);
 
-            let reason_str = match reason {
-                xphone::EndReason::Local => "local",
-                xphone::EndReason::Remote => "normal",
-                xphone::EndReason::Transfer => "transfer",
-                xphone::EndReason::Rejected => "rejected",
-                xphone::EndReason::Cancelled => "cancelled",
-                xphone::EndReason::Timeout => "timeout",
-                xphone::EndReason::Error => "error",
-            };
+            let reason_str = end_reason_str(reason);
 
-            ended_webhook
+            ended_state
+                .webhook
                 .send_event(&WebhookEvent::Ended {
                     call_id,
                     reason: reason_str.to_string(),
@@ -81,10 +68,11 @@ pub async fn run(config: &Config, state: AppState) -> Result<(), Box<dyn std::er
     });
 
     // Spawn DTMF webhook delivery task
-    let dtmf_webhook = webhook.clone();
+    let dtmf_state = state.clone();
     tokio::spawn(async move {
         while let Some((call_id, digit)) = dtmf_rx.recv().await {
-            dtmf_webhook
+            dtmf_state
+                .webhook
                 .send_event(&WebhookEvent::Dtmf { call_id, digit })
                 .await;
         }
@@ -93,24 +81,15 @@ pub async fn run(config: &Config, state: AppState) -> Result<(), Box<dyn std::er
     // Handle incoming calls
     while let Some(call) = incoming_rx.recv().await {
         let state = state.clone();
-        let webhook = webhook.clone();
-        let ended_tx = ended_tx.clone();
-        let dtmf_tx = dtmf_tx.clone();
         tokio::spawn(async move {
-            handle_incoming(call, state, webhook, ended_tx, dtmf_tx).await;
+            handle_incoming(call, state).await;
         });
     }
 
     Ok(())
 }
 
-async fn handle_incoming(
-    call: Arc<xphone::Call>,
-    state: AppState,
-    webhook: WebhookClient,
-    ended_tx: mpsc::Sender<(String, xphone::EndReason, std::time::Duration)>,
-    dtmf_tx: mpsc::Sender<(String, String)>,
-) {
+async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
     let call_id = call.id();
     let from = call.from();
     let to = call.to();
@@ -125,7 +104,7 @@ async fn handle_incoming(
         direction: CallDirection::Inbound,
     };
 
-    let response = match webhook.send_incoming(&hook).await {
+    let response = match state.webhook.send_incoming(&hook).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("incoming webhook failed for {call_id}: {e}");
@@ -157,25 +136,14 @@ async fn handle_incoming(
                 .insert(call_id.clone(), call.clone());
 
             // Send call.answered webhook
-            webhook
+            state
+                .webhook
                 .send_event(&WebhookEvent::Answered {
                     call_id: call_id.clone(),
                 })
                 .await;
 
-            // Wire call-ended callback
-            let call_for_ended = call.clone();
-            let cid = call_id.clone();
-            call.on_ended(move |reason: xphone::EndReason| {
-                let duration = call_for_ended.duration();
-                let _ = ended_tx.blocking_send((cid.clone(), reason, duration));
-            });
-
-            // Wire DTMF callback
-            let cid = call_id;
-            call.on_dtmf(move |digit: String| {
-                let _ = dtmf_tx.blocking_send((cid.clone(), digit));
-            });
+            wire_call_callbacks(&call, &call_id, &state);
         }
         IncomingCallAction::Reject => {
             let reason = response.reason.as_deref().unwrap_or("busy");
@@ -190,6 +158,100 @@ async fn handle_incoming(
     }
 }
 
+/// Wire on_ended and on_dtmf callbacks for a call. Used by both inbound and outbound paths.
+pub(crate) fn wire_call_callbacks(
+    call: &Arc<xphone::Call>,
+    call_id: &str,
+    state: &AppState,
+) {
+    // Wire call-ended callback
+    let call_for_ended = call.clone();
+    let cid = call_id.to_string();
+    let ended_tx = state.ended_tx.clone();
+    call.on_ended(move |reason: xphone::EndReason| {
+        let duration = call_for_ended.duration();
+        let _ = ended_tx.blocking_send((cid.clone(), reason, duration));
+    });
+
+    // Wire DTMF callback
+    let cid = call_id.to_string();
+    let dtmf_tx = state.dtmf_tx.clone();
+    call.on_dtmf(move |digit: String| {
+        let _ = dtmf_tx.blocking_send((cid.clone(), digit));
+    });
+}
+
+/// Wire on_state callback for outbound calls to track ringing/answered transitions.
+pub(crate) fn wire_outbound_state_callbacks(
+    call: &Arc<xphone::Call>,
+    call_id: &str,
+    state: &AppState,
+) {
+    let cid = call_id.to_string();
+    let state = state.clone();
+    let from = call.from();
+    let to = call.to();
+    call.on_state(move |new_state: xphone::CallState| {
+        let cid = cid.clone();
+        let state = state.clone();
+        let from = from.clone();
+        let to = to.clone();
+        // Use a separate tokio task for async webhook delivery
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                match new_state {
+                    xphone::CallState::RemoteRinging => {
+                        // Update status to ringing
+                        if let Some(info) = state.calls.write().await.get_mut(&cid) {
+                            info.status = CallStatus::Ringing;
+                        }
+                        state
+                            .webhook
+                            .send_event(&WebhookEvent::Ringing {
+                                call_id: cid,
+                                from,
+                                to,
+                            })
+                            .await;
+                    }
+                    xphone::CallState::Active => {
+                        // Update status to in_progress
+                        if let Some(info) = state.calls.write().await.get_mut(&cid) {
+                            info.status = CallStatus::InProgress;
+                        }
+                        state
+                            .webhook
+                            .send_event(&WebhookEvent::Answered { call_id: cid })
+                            .await;
+                    }
+                    xphone::CallState::OnHold => {
+                        if let Some(info) = state.calls.write().await.get_mut(&cid) {
+                            info.status = CallStatus::OnHold;
+                        }
+                        state
+                            .webhook
+                            .send_event(&WebhookEvent::Hold { call_id: cid })
+                            .await;
+                    }
+                    _ => {}
+                }
+            });
+        });
+    });
+}
+
+pub(crate) fn end_reason_str(reason: xphone::EndReason) -> &'static str {
+    match reason {
+        xphone::EndReason::Local => "local",
+        xphone::EndReason::Remote => "normal",
+        xphone::EndReason::Transfer => "transfer",
+        xphone::EndReason::Rejected => "rejected",
+        xphone::EndReason::Cancelled => "cancelled",
+        xphone::EndReason::Timeout => "timeout",
+        xphone::EndReason::Error => "error",
+    }
+}
+
 fn build_xphone_config(config: &Config) -> xphone::Config {
     let transport = match config.sip.transport {
         crate::config::SipTransport::Udp => "udp",
@@ -197,7 +259,7 @@ fn build_xphone_config(config: &Config) -> xphone::Config {
         crate::config::SipTransport::Tls => "tls",
     };
 
-    xphone::PhoneBuilder::new()
+    let mut builder = xphone::PhoneBuilder::new()
         .credentials(
             &config.sip.username,
             &config.sip.password,
@@ -205,6 +267,11 @@ fn build_xphone_config(config: &Config) -> xphone::Config {
         )
         .transport(transport)
         .rtp_ports(config.sip.rtp_port_min, config.sip.rtp_port_max)
-        .srtp(config.sip.srtp)
-        .build()
+        .srtp(config.sip.srtp);
+
+    if let Some(ref stun) = config.sip.stun_server {
+        builder = builder.stun_server(stun);
+    }
+
+    builder.build()
 }

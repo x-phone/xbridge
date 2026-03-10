@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 use xbridge::config::Config;
 use xbridge::router::app;
 use xbridge::state::AppState;
+use xbridge::webhook_client::WebhookClient;
 
 #[tokio::main]
 async fn main() {
@@ -20,13 +21,20 @@ async fn main() {
     });
 
     let addr = config.listen.http.clone();
-    let state = AppState::new(config.clone());
+    let webhook = WebhookClient::new(&config.webhook);
+
+    let (ended_tx, ended_rx) = tokio::sync::mpsc::channel(32);
+    let (dtmf_tx, dtmf_rx) = tokio::sync::mpsc::channel(32);
+
+    let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx);
 
     // Start SIP bridge in background
     let bridge_state = state.clone();
     let bridge_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = xbridge::bridge::run(&bridge_config, bridge_state).await {
+        if let Err(e) =
+            xbridge::bridge::run(&bridge_config, bridge_state, ended_rx, dtmf_rx).await
+        {
             tracing::error!("SIP bridge error: {e}");
         }
     });
