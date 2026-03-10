@@ -461,4 +461,134 @@ async fn webhook_retries_on_failure() {
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+
+    // Failed event should be in the DLQ
+    assert_eq!(client.dlq_len(), 1);
+    let failures = client.dlq_list();
+    assert_eq!(failures[0].attempts, 3);
+    assert!(failures[0].error.contains("500"));
+}
+
+#[tokio::test]
+async fn webhook_backoff_increases_delay() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let attempt_count = Arc::new(AtomicU32::new(0));
+    let count_clone = attempt_count.clone();
+
+    let mock_app = axum::Router::new().route(
+        "/events",
+        axum::routing::post(move || {
+            let count = count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }),
+    );
+
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let config = WebhookConfig {
+        url: format!("http://127.0.0.1:{}/events", mock_addr.port()),
+        timeout: "5s".into(),
+        retry: 3, // 1 initial + 3 retries = 4 attempts, backoff: 100ms + 200ms + 400ms = 700ms
+    };
+    let client = WebhookClient::new(&config);
+
+    let start = std::time::Instant::now();
+    let event = xbridge::webhook::WebhookEvent::Answered {
+        call_id: "backoff_test".into(),
+    };
+    client.send_event(&event).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 4);
+    // Total backoff should be at least 700ms (100 + 200 + 400)
+    assert!(
+        elapsed >= std::time::Duration::from_millis(600),
+        "elapsed {elapsed:?} should be >= 600ms"
+    );
+}
+
+#[tokio::test]
+async fn dlq_endpoint_shows_failures() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let attempt_count = Arc::new(AtomicU32::new(0));
+    let count_clone = attempt_count.clone();
+
+    // Mock webhook that always fails
+    let mock_app = axum::Router::new().route(
+        "/events",
+        axum::routing::post(move || {
+            let count = count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }),
+    );
+
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    // Build state with webhook pointing to failing mock
+    let mut config = test_config();
+    config.webhook.url = format!("http://127.0.0.1:{}/events", mock_addr.port());
+    config.webhook.retry = 0; // no retries, fail fast
+    let state = test_state_from(config);
+    let base = spawn_server(state.clone()).await;
+
+    // Trigger a failed webhook delivery
+    let event = xbridge::webhook::WebhookEvent::Answered {
+        call_id: "dlq_test".into(),
+    };
+    state.webhook.send_event(&event).await;
+
+    // Check DLQ via REST
+    let client = reqwest::Client::new();
+    let body: serde_json::Value = client
+        .get(format!("{base}/v1/webhooks/failures"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let failures = body["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["event"]["call_id"], "dlq_test");
+
+    // Drain via REST
+    let body: serde_json::Value = client
+        .delete(format!("{base}/v1/webhooks/failures"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["drained"], 1);
+
+    // Verify empty
+    let body: serde_json::Value = client
+        .get(format!("{base}/v1/webhooks/failures"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["failures"].as_array().unwrap().len(), 0);
 }

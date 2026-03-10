@@ -172,6 +172,37 @@ POST /v1/calls/{call_id}/mute
 POST /v1/calls/{call_id}/unmute
 ```
 
+### Webhook Failures (Dead Letter Queue)
+
+Events that fail delivery after all retries are stored in an in-memory dead letter queue (max 1000 entries).
+
+```
+GET /v1/webhooks/failures
+```
+
+```json
+{
+  "failures": [
+    {
+      "event": {"event": "call.ended", "call_id": "abc123", "reason": "normal", "duration": 45},
+      "error": "HTTP 502",
+      "attempts": 3,
+      "timestamp": "2025-03-10T14:30:00Z"
+    }
+  ]
+}
+```
+
+Drain (acknowledge and clear):
+
+```
+DELETE /v1/webhooks/failures
+```
+
+```json
+{"drained": 1}
+```
+
 ## WebSocket Audio Streaming
 
 Connect to `ws://host:8080/ws/{call_id}` to stream audio for a call.
@@ -244,6 +275,12 @@ Events are POSTed to `{webhook_url}`:
 | `call.dtmf` | `call_id`, `digit` |
 | `call.hold` | `call_id` |
 | `call.resumed` | `call_id` |
+
+### Retry and Dead Letter Queue
+
+Event delivery uses exponential backoff (100ms base, doubling each retry). The number of retries is configured via `webhook.retry` (default: 1).
+
+Events that fail all delivery attempts are stored in an in-memory dead letter queue (max 1000 entries, oldest evicted). Inspect and drain via `GET/DELETE /v1/webhooks/failures`.
 
 ## Monitoring
 

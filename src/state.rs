@@ -19,7 +19,7 @@ pub struct AppState {
     pub(crate) ended_tx: mpsc::Sender<(String, xphone::EndReason, std::time::Duration)>,
     pub(crate) dtmf_tx: mpsc::Sender<(String, String)>,
     pub(crate) state_tx: mpsc::Sender<(String, xphone::CallState)>,
-    pub(crate) webhook: WebhookClient,
+    pub webhook: WebhookClient,
     pub(crate) config: Arc<Config>,
     pub(crate) metrics: Metrics,
 }

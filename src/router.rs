@@ -41,6 +41,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/calls/{call_id}/dtmf", post(send_dtmf))
         .route("/v1/calls/{call_id}/mute", post(mute_call))
         .route("/v1/calls/{call_id}/unmute", post(unmute_call))
+        .route(
+            "/v1/webhooks/failures",
+            get(list_webhook_failures).delete(drain_webhook_failures),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .route_layer(middleware::from_fn_with_state(
             rate_limiter,
@@ -415,6 +419,20 @@ async fn unmute_call(
     }
 
     StatusCode::OK
+}
+
+async fn list_webhook_failures(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let failures = state.webhook.dlq_list();
+    Json(serde_json::json!({ "failures": failures }))
+}
+
+async fn drain_webhook_failures(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let failures = state.webhook.dlq_drain();
+    Json(serde_json::json!({ "drained": failures.len() }))
 }
 
 async fn ws_handler(
@@ -1063,6 +1081,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Webhook DLQ endpoints ──
+
+    #[tokio::test]
+    async fn list_webhook_failures_empty() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/webhooks/failures")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = body_json(resp).await;
+        assert_eq!(body["failures"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn drain_webhook_failures_returns_count() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/webhooks/failures")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = body_json(resp).await;
+        assert_eq!(body["drained"], 0);
     }
 
     // ── Auth middleware ──
