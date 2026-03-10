@@ -41,7 +41,10 @@ impl std::error::Error for ConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub listen: ListenConfig,
+    #[serde(default)]
     pub sip: SipConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trunks: Vec<TrunkConfig>,
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub stream: StreamConfig,
@@ -51,6 +54,13 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrunkConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub sip: SipConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,6 +92,21 @@ pub enum SipTransport {
     Udp,
     Tcp,
     Tls,
+}
+
+impl Default for SipConfig {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            password: String::new(),
+            host: "localhost".into(),
+            transport: default_transport(),
+            rtp_port_min: default_rtp_port_min(),
+            rtp_port_max: default_rtp_port_max(),
+            srtp: false,
+            stun_server: None,
+        }
+    }
 }
 
 fn default_transport() -> SipTransport {
@@ -178,16 +203,8 @@ impl Default for Config {
             listen: ListenConfig {
                 http: "0.0.0.0:8080".into(),
             },
-            sip: SipConfig {
-                username: String::new(),
-                password: String::new(),
-                host: "localhost".into(),
-                transport: default_transport(),
-                rtp_port_min: default_rtp_port_min(),
-                rtp_port_max: default_rtp_port_max(),
-                srtp: false,
-                stun_server: None,
-            },
+            sip: SipConfig::default(),
+            trunks: Vec::new(),
             webhook: WebhookConfig {
                 url: "http://localhost:3000/events".into(),
                 timeout: default_timeout(),
@@ -198,6 +215,20 @@ impl Default for Config {
             tls: TlsConfig::default(),
             rate_limit: RateLimitConfig::default(),
         }
+    }
+}
+
+impl Config {
+    /// Returns the resolved trunk list. If `trunks` is populated, use it.
+    /// Otherwise, synthesize a single trunk from the legacy `sip` block.
+    pub fn resolved_trunks(&self) -> Vec<TrunkConfig> {
+        if !self.trunks.is_empty() {
+            return self.trunks.clone();
+        }
+        vec![TrunkConfig {
+            name: "default".into(),
+            sip: self.sip.clone(),
+        }]
     }
 }
 
@@ -260,7 +291,7 @@ impl Config {
             config.listen.http = v;
         }
 
-        // SIP
+        // SIP (legacy single-trunk)
         if let Ok(v) = get_var("XBRIDGE_SIP_USERNAME") {
             config.sip.username = v;
         }
@@ -755,6 +786,159 @@ sample_rate = 16000
         let config = Config::load(None).unwrap();
         assert_eq!(config, Config::default());
     }
+
+    // ── resolved_trunks() ──
+
+    #[test]
+    fn resolved_trunks_falls_back_to_sip_block() {
+        let config = Config {
+            trunks: Vec::new(),
+            sip: SipConfig {
+                username: "1001".into(),
+                password: "pass".into(),
+                host: "sip.example.com".into(),
+                ..SipConfig::default()
+            },
+            ..Config::default()
+        };
+        let trunks = config.resolved_trunks();
+        assert_eq!(trunks.len(), 1);
+        assert_eq!(trunks[0].name, "default");
+        assert_eq!(trunks[0].sip.username, "1001");
+        assert_eq!(trunks[0].sip.host, "sip.example.com");
+    }
+
+    #[test]
+    fn resolved_trunks_uses_explicit_trunks() {
+        let config = Config {
+            trunks: vec![
+                TrunkConfig {
+                    name: "primary".into(),
+                    sip: SipConfig {
+                        username: "a".into(),
+                        password: "pa".into(),
+                        host: "sip.a.com".into(),
+                        ..SipConfig::default()
+                    },
+                },
+                TrunkConfig {
+                    name: "secondary".into(),
+                    sip: SipConfig {
+                        username: "b".into(),
+                        password: "pb".into(),
+                        host: "sip.b.com".into(),
+                        ..SipConfig::default()
+                    },
+                },
+            ],
+            ..Config::default()
+        };
+        let trunks = config.resolved_trunks();
+        assert_eq!(trunks.len(), 2);
+        assert_eq!(trunks[0].name, "primary");
+        assert_eq!(trunks[0].sip.host, "sip.a.com");
+        assert_eq!(trunks[1].name, "secondary");
+        assert_eq!(trunks[1].sip.host, "sip.b.com");
+    }
+
+    #[test]
+    fn resolved_trunks_ignores_sip_block_when_trunks_set() {
+        let config = Config {
+            sip: SipConfig {
+                username: "ignored".into(),
+                password: "ignored".into(),
+                host: "sip.ignored.com".into(),
+                ..SipConfig::default()
+            },
+            trunks: vec![TrunkConfig {
+                name: "only".into(),
+                sip: SipConfig {
+                    username: "used".into(),
+                    password: "used".into(),
+                    host: "sip.used.com".into(),
+                    ..SipConfig::default()
+                },
+            }],
+            ..Config::default()
+        };
+        let trunks = config.resolved_trunks();
+        assert_eq!(trunks.len(), 1);
+        assert_eq!(trunks[0].sip.host, "sip.used.com");
+    }
+
+    // ── Multi-trunk YAML/TOML parsing ──
+
+    const MULTI_TRUNK_YAML: &str = r#"
+listen:
+  http: "0.0.0.0:8080"
+
+trunks:
+  - name: "telnyx"
+    username: "1001"
+    password: "secret1"
+    host: "sip.telnyx.com"
+    transport: "tls"
+    srtp: true
+  - name: "twilio"
+    username: "2001"
+    password: "secret2"
+    host: "sip.twilio.com"
+    transport: "udp"
+
+webhook:
+  url: "https://app.com/events"
+"#;
+
+    #[test]
+    fn from_yaml_multi_trunk() {
+        let config = Config::from_yaml(MULTI_TRUNK_YAML).unwrap();
+        assert_eq!(config.trunks.len(), 2);
+        assert_eq!(config.trunks[0].name, "telnyx");
+        assert_eq!(config.trunks[0].sip.host, "sip.telnyx.com");
+        assert_eq!(config.trunks[0].sip.transport, SipTransport::Tls);
+        assert!(config.trunks[0].sip.srtp);
+        assert_eq!(config.trunks[1].name, "twilio");
+        assert_eq!(config.trunks[1].sip.host, "sip.twilio.com");
+        assert_eq!(config.trunks[1].sip.transport, SipTransport::Udp);
+
+        let resolved = config.resolved_trunks();
+        assert_eq!(resolved.len(), 2);
+    }
+
+    const MULTI_TRUNK_TOML: &str = r#"
+[listen]
+http = "0.0.0.0:8080"
+
+[[trunks]]
+name = "telnyx"
+username = "1001"
+password = "secret1"
+host = "sip.telnyx.com"
+transport = "tls"
+srtp = true
+
+[[trunks]]
+name = "twilio"
+username = "2001"
+password = "secret2"
+host = "sip.twilio.com"
+
+[webhook]
+url = "https://app.com/events"
+"#;
+
+    #[test]
+    fn from_toml_multi_trunk() {
+        let config = Config::from_toml(MULTI_TRUNK_TOML).unwrap();
+        assert_eq!(config.trunks.len(), 2);
+        assert_eq!(config.trunks[0].name, "telnyx");
+        assert_eq!(config.trunks[0].sip.host, "sip.telnyx.com");
+        assert!(config.trunks[0].sip.srtp);
+        assert_eq!(config.trunks[1].name, "twilio");
+        assert_eq!(config.trunks[1].sip.host, "sip.twilio.com");
+    }
+
+    // ── load() combines file + env ──
 
     #[test]
     fn load_from_yaml_file() {

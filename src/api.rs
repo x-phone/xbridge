@@ -12,6 +12,8 @@ pub struct CreateCallRequest {
     pub webhook_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trunk: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +86,7 @@ mod tests {
             from: "+15559876543".into(),
             webhook_url: Some("https://app.com/events".into()),
             stream: Some(true),
+            trunk: Some("primary".into()),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["to"], "+15551234567");
@@ -111,10 +114,12 @@ mod tests {
             from: "+15559876543".into(),
             webhook_url: None,
             stream: None,
+            trunk: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("webhook_url").is_none());
         assert!(json.get("stream").is_none());
+        assert!(json.get("trunk").is_none());
     }
 
     // ── CreateCallResponse ──

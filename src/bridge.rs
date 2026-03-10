@@ -3,11 +3,11 @@ use tokio::sync::mpsc;
 
 use crate::api::{IncomingCallAction, IncomingCallWebhook};
 use crate::call::{CallDirection, CallInfo, CallStatus};
-use crate::config::Config;
+use crate::config::{Config, SipConfig};
 use crate::state::AppState;
 use crate::webhook::WebhookEvent;
 
-/// Start the SIP bridge: register with the trunk, handle incoming calls.
+/// Start the SIP bridge: register with all configured trunks, handle incoming calls.
 pub async fn run(
     config: &Config,
     state: AppState,
@@ -15,38 +15,61 @@ pub async fn run(
     mut dtmf_rx: mpsc::Receiver<(String, String)>,
     mut state_rx: mpsc::Receiver<(String, xphone::CallState)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let xphone_config = build_xphone_config(config);
-    let phone = xphone::Phone::new(xphone_config);
+    let trunks = config.resolved_trunks();
+    if trunks.is_empty() {
+        return Err("no SIP trunks configured".into());
+    }
 
-    // Channel for incoming calls (sync callback → async handler)
+    // Channel for incoming calls (shared across all trunks)
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<Arc<xphone::Call>>(32);
 
-    phone.on_registered(|| {
-        tracing::info!("SIP registration successful");
-    });
+    // Connect each trunk
+    for trunk in &trunks {
+        let xphone_config = build_xphone_config(&trunk.sip);
+        let phone = xphone::Phone::new(xphone_config);
 
-    phone.on_unregistered(|| {
-        tracing::warn!("SIP registration lost");
-    });
+        let trunk_name = trunk.name.clone();
+        let tx = incoming_tx.clone();
 
-    phone.on_incoming(move |call: Arc<xphone::Call>| {
-        if incoming_tx.blocking_send(call).is_err() {
-            tracing::error!("incoming call channel closed");
-        }
-    });
+        phone.on_registered({
+            let name = trunk_name.clone();
+            move || tracing::info!("SIP registration successful for trunk '{name}'")
+        });
 
-    // Connect to SIP trunk (blocking — runs registration)
-    let phone = {
-        let phone_for_connect = phone;
-        tokio::task::spawn_blocking(move || {
-            phone_for_connect.connect()?;
-            Ok::<_, xphone::Error>(phone_for_connect)
-        })
-        .await??
-    };
+        phone.on_unregistered({
+            let name = trunk_name.clone();
+            move || tracing::warn!("SIP registration lost for trunk '{name}'")
+        });
 
-    // Store phone in state for outbound dialing
-    let _ = state.phone.set(phone);
+        phone.on_incoming(move |call: Arc<xphone::Call>| {
+            if tx.blocking_send(call).is_err() {
+                tracing::error!("incoming call channel closed");
+            }
+        });
+
+        let phone = {
+            let phone_for_connect = phone;
+            let name = trunk_name.clone();
+            tokio::task::spawn_blocking(move || {
+                phone_for_connect.connect().map_err(|e| {
+                    tracing::error!("trunk '{name}' connect failed: {e}");
+                    e
+                })?;
+                Ok::<_, xphone::Error>(phone_for_connect)
+            })
+            .await??
+        };
+
+        tracing::info!("trunk '{}' connected", trunk_name);
+        state
+            .phones
+            .write()
+            .await
+            .insert(trunk_name, phone);
+    }
+
+    // Drop our copy so the channel closes when all phones drop theirs
+    drop(incoming_tx);
 
     // Spawn call-ended cleanup task
     let ended_state = state.clone();
@@ -264,24 +287,20 @@ pub(crate) fn end_reason_str(reason: xphone::EndReason) -> &'static str {
     }
 }
 
-fn build_xphone_config(config: &Config) -> xphone::Config {
-    let transport = match config.sip.transport {
+fn build_xphone_config(sip: &SipConfig) -> xphone::Config {
+    let transport = match sip.transport {
         crate::config::SipTransport::Udp => "udp",
         crate::config::SipTransport::Tcp => "tcp",
         crate::config::SipTransport::Tls => "tls",
     };
 
     let mut builder = xphone::PhoneBuilder::new()
-        .credentials(
-            &config.sip.username,
-            &config.sip.password,
-            &config.sip.host,
-        )
+        .credentials(&sip.username, &sip.password, &sip.host)
         .transport(transport)
-        .rtp_ports(config.sip.rtp_port_min, config.sip.rtp_port_max)
-        .srtp(config.sip.srtp);
+        .rtp_ports(sip.rtp_port_min, sip.rtp_port_max)
+        .srtp(sip.srtp);
 
-    if let Some(ref stun) = config.sip.stun_server {
+    if let Some(ref stun) = sip.stun_server {
         builder = builder.stun_server(stun);
     }
 

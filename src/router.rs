@@ -16,7 +16,7 @@ use crate::api::{
 use crate::audio;
 use crate::bridge;
 use crate::call::{CallDirection, CallInfo, CallStatus};
-use crate::config::AudioEncoding;
+use crate::config::{AudioEncoding, StreamMode};
 use crate::state::AppState;
 use crate::webhook::WebhookEvent;
 use crate::ws::{ClientEvent, MediaFormat, ServerEvent, ServerMediaPayload, StartPayload};
@@ -132,13 +132,15 @@ async fn auth_middleware(
 }
 
 async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let sip_connected = state.phone.get().is_some();
+    let phones = state.phones.read().await;
+    let trunk_count = phones.len();
+    drop(phones);
     let active_calls = state.calls.read().await.len();
-    let status = if sip_connected { "ok" } else { "starting" };
+    let status = if trunk_count > 0 { "ok" } else { "starting" };
 
     Json(serde_json::json!({
         "status": status,
-        "sip_connected": sip_connected,
+        "sip_trunks": trunk_count,
         "active_calls": active_calls,
     }))
 }
@@ -197,9 +199,16 @@ async fn create_call(
     headers: HeaderMap,
     Json(req): Json<CreateCallRequest>,
 ) -> Result<Json<CreateCallResponse>, StatusCode> {
-    if state.phone.get().is_none() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    let trunk_name = req.trunk.as_deref().unwrap_or("default");
+
+    let phones = state.phones.read().await;
+    if !phones.contains_key(trunk_name) {
+        if phones.is_empty() {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        return Err(StatusCode::NOT_FOUND);
     }
+    drop(phones);
 
     let from = req.from.clone();
     let to = req.to.clone();
@@ -210,9 +219,11 @@ async fn create_call(
     };
 
     // Phone::dial is blocking
-    let phone_ref = state.phone.clone();
+    let phones_ref = state.phones.clone();
+    let trunk = trunk_name.to_string();
     let call = tokio::task::spawn_blocking(move || {
-        let phone = phone_ref.get().ok_or(xphone::Error::NotConnected)?;
+        let phones = phones_ref.blocking_read();
+        let phone = phones.get(&trunk).ok_or(xphone::Error::NotConnected)?;
         phone.dial(&to, opts)
     })
     .await
@@ -413,12 +424,13 @@ async fn ws_handler(
 ) -> Result<impl IntoResponse, StatusCode> {
     let call = get_xphone_call(&state, &call_id).await?;
 
+    let mode = state.config.stream.mode.clone();
     let encoding = state.config.stream.encoding.clone();
     let sample_rate = state.config.stream.sample_rate;
     let metrics = state.metrics.clone();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_ws(socket, call_id, call, encoding, sample_rate, metrics)
+        handle_ws(socket, call_id, call, mode, encoding, sample_rate, metrics)
     }))
 }
 
@@ -426,28 +438,28 @@ async fn handle_ws(
     socket: WebSocket,
     call_id: String,
     call: Arc<xphone::Call>,
+    mode: StreamMode,
     encoding: AudioEncoding,
     sample_rate: u32,
     metrics: crate::metrics::Metrics,
 ) {
     metrics.inc_ws_connections();
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Send "connected" + "start" events (JSON text in both modes)
     let encoding_str = match encoding {
         AudioEncoding::Mulaw => "audio/x-mulaw",
         AudioEncoding::L16 => "audio/x-l16",
     };
-
-    let (mut ws_tx, mut ws_rx) = socket.split();
-
-    // Send "connected" event
     let connected = ServerEvent::Connected {
         protocol: "Call".into(),
         version: "1.0.0".into(),
     };
     if send_json(&mut ws_tx, &connected).await.is_err() {
+        metrics.dec_ws_connections();
         return;
     }
-
-    // Send "start" event
     let start = ServerEvent::Start {
         stream_sid: call_id.clone(),
         start: StartPayload {
@@ -461,6 +473,7 @@ async fn handle_ws(
         },
     };
     if send_json(&mut ws_tx, &start).await.is_err() {
+        metrics.dec_ws_connections();
         return;
     }
 
@@ -474,51 +487,72 @@ async fn handle_ws(
             },
         )
         .await;
+        metrics.dec_ws_connections();
         return;
     };
 
-    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Message>(64);
 
     // Blocking reader: pcm_rx → audio_tx
+    let reader_mode = mode.clone();
     let encoding_reader = encoding.clone();
     let cid_sender = call_id.clone();
     let mut reader_handle = tokio::task::spawn_blocking(move || {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let mut timestamp: u64 = 0;
-
         let stream_sid = call_id;
         let mut encode_buf = Vec::new();
 
-        while let Ok(frame) = pcm_rx.recv() {
-            encode_buf.clear();
-            match encoding_reader {
-                AudioEncoding::Mulaw => audio::pcm16_to_mulaw_into(&frame, &mut encode_buf),
-                AudioEncoding::L16 => audio::pcm16_to_bytes_into(&frame, &mut encode_buf),
-            };
-            let payload = b64.encode(&encode_buf);
+        match reader_mode {
+            StreamMode::Twilio => {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let mut timestamp: u64 = 0;
 
-            let event = ServerEvent::Media {
-                stream_sid: stream_sid.clone(),
-                media: ServerMediaPayload {
-                    timestamp: timestamp.to_string(),
-                    payload,
-                },
-            };
+                while let Ok(frame) = pcm_rx.recv() {
+                    encode_buf.clear();
+                    match encoding_reader {
+                        AudioEncoding::Mulaw => {
+                            audio::pcm16_to_mulaw_into(&frame, &mut encode_buf)
+                        }
+                        AudioEncoding::L16 => {
+                            audio::pcm16_to_bytes_into(&frame, &mut encode_buf)
+                        }
+                    };
+                    let payload = b64.encode(&encode_buf);
 
-            if let Ok(json) = serde_json::to_string(&event) {
-                if audio_tx.blocking_send(json).is_err() {
-                    break; // WS closed
+                    let event = ServerEvent::Media {
+                        stream_sid: stream_sid.clone(),
+                        media: ServerMediaPayload {
+                            timestamp: timestamp.to_string(),
+                            payload,
+                        },
+                    };
+
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        if audio_tx.blocking_send(Message::Text(json.into())).is_err() {
+                            break;
+                        }
+                    }
+                    timestamp += frame.len() as u64;
                 }
             }
-
-            timestamp += frame.len() as u64;
+            StreamMode::Native => {
+                while let Ok(frame) = pcm_rx.recv() {
+                    encode_buf.clear();
+                    audio::pcm16_to_bytes_into(&frame, &mut encode_buf);
+                    if let Some(binary) = crate::ws::encode_native_audio(&encode_buf) {
+                        if audio_tx.blocking_send(Message::Binary(binary.into())).is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     });
 
     // Async sender: audio_rx → ws_tx
     let mut sender_handle = tokio::spawn(async move {
-        while let Some(json) = audio_rx.recv().await {
-            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+        while let Some(msg) = audio_rx.recv().await {
+            if ws_tx.send(msg).await.is_err() {
                 break;
             }
         }
@@ -532,29 +566,34 @@ async fn handle_ws(
         let _ = ws_tx.close().await;
     });
 
-    // Task 2: WebSocket → xphone audio (client audio to call)
+    // Receiver: WebSocket → xphone audio (client audio to call)
     let mut receiver_handle = tokio::spawn(async move {
         let b64 = base64::engine::general_purpose::STANDARD;
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
+                Message::Binary(data) if mode == StreamMode::Native => {
+                    if let Some(pcm_bytes) = crate::ws::decode_native_audio(&data) {
+                        let pcm = audio::bytes_to_pcm16(pcm_bytes);
+                        let _ = pcm_tx.try_send(pcm);
+                    }
+                }
                 Message::Text(text) => {
                     if let Ok(event) = serde_json::from_str::<ClientEvent>(&text) {
                         match event {
                             ClientEvent::Media { media, .. } => {
                                 if let Ok(bytes) = b64.decode(&media.payload) {
                                     let pcm = match encoding {
-                                        AudioEncoding::Mulaw => audio::mulaw_to_pcm16(&bytes),
-                                        AudioEncoding::L16 => audio::bytes_to_pcm16(&bytes),
+                                        AudioEncoding::Mulaw => {
+                                            audio::mulaw_to_pcm16(&bytes)
+                                        }
+                                        AudioEncoding::L16 => {
+                                            audio::bytes_to_pcm16(&bytes)
+                                        }
                                     };
                                     let _ = pcm_tx.try_send(pcm);
                                 }
                             }
-                            ClientEvent::Clear { .. } => {
-                                // Clear pending audio — no-op for now
-                            }
-                            ClientEvent::Mark { .. } => {
-                                // Mark acknowledgment — no-op for now
-                            }
+                            ClientEvent::Clear { .. } | ClientEvent::Mark { .. } => {}
                         }
                     }
                 }
@@ -608,6 +647,7 @@ mod tests {
                 srtp: false,
                 stun_server: None,
             },
+            trunks: Vec::new(),
             webhook: WebhookConfig {
                 url: "http://localhost:9090/events".into(),
                 timeout: "5s".into(),
@@ -672,7 +712,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = body_json(resp).await;
         assert_eq!(body["status"], "starting");
-        assert_eq!(body["sip_connected"], false);
+        assert_eq!(body["sip_trunks"], 0);
         assert_eq!(body["active_calls"], 0);
     }
 
@@ -988,6 +1028,35 @@ mod tests {
                     .method("POST")
                     .uri("/v1/calls/nonexistent/unmute")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Trunk selection in create_call ──
+
+    #[tokio::test]
+    async fn create_call_unknown_trunk_returns_404() {
+        let state = test_state();
+        // Insert a phone so phones isn't empty (otherwise we'd get 503)
+        state
+            .phones
+            .write()
+            .await
+            .insert("default".into(), xphone::Phone::new(xphone::Config::default()));
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"to":"+15551234567","from":"+15559876543","trunk":"nonexistent"}"#,
+                    ))
                     .unwrap(),
             )
             .await
