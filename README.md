@@ -284,6 +284,39 @@ tls:
   key: "/path/to/key.pem"
 ```
 
+## Architecture
+
+xbridge is designed as a **data plane** — it handles real-time SIP signaling, RTP media, and WebSocket audio streaming. It is intentionally stateless: no database, no persistent storage, no recording engine.
+
+For production deployments that need call recordings, CDR storage, billing, or dashboards, the intended architecture is a separate **control plane** that consumes xbridge's webhook events and WebSocket audio:
+
+```
+┌─────────────┐    webhooks     ┌─────────────────┐
+│             │ ──────────────> │                 │
+│   xbridge   │                 │  Control Plane  │──> DB, S3, dashboards
+│ (data plane)│ <────────────── │                 │
+│             │   REST calls    │                 │
+└──────┬──────┘                 └────────┬────────┘
+       │                                 │
+   SIP/RTP                          WebSocket
+       │                           (audio tap)
+       v                                 │
+┌──────────────┐                         v
+│  SIP Trunk   │                 ┌──────────────┐
+│  (Telnyx,    │                 │  Recording / │
+│   Twilio)    │                 │  Transcription│
+└──────────────┘                 └──────────────┘
+```
+
+**How it works:**
+
+1. xbridge fires webhook events (`call.ringing`, `call.answered`, `call.ended`, etc.) to the control plane — this is the existing `webhook.url` config.
+2. The control plane persists call events, manages state, and exposes dashboards.
+3. For recordings, the control plane connects to the `ws_url` returned by xbridge (from the create call response or incoming call webhook), receives the audio stream, and writes it to storage (disk, S3, etc.).
+4. The control plane drives call actions (hangup, transfer, DTMF) via xbridge's REST API.
+
+This separation keeps xbridge fast and simple — it never touches disk for call data — while letting you build whatever persistence and business logic you need on top.
+
 ## Development
 
 ```bash
