@@ -259,9 +259,6 @@ pub(crate) fn wire_call_callbacks(
     let dtmf_tx = state.dtmf_tx.clone();
     let ws_senders = state.ws_senders.clone();
     call.on_dtmf(move |digit: String| {
-        // Forward to webhook drain task
-        let _ = dtmf_tx.blocking_send((cid.clone(), digit.clone()));
-
         // Forward to active WebSocket (if connected)
         if let Ok(senders) = ws_senders.read() {
             if let Some(ws_tx) = senders.get(&cid) {
@@ -278,6 +275,9 @@ pub(crate) fn wire_call_callbacks(
                 }
             }
         }
+
+        // Forward to webhook drain task (consumes digit)
+        let _ = dtmf_tx.blocking_send((cid.clone(), digit));
     });
 }
 

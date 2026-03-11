@@ -1251,7 +1251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn play_requires_audio_source() {
+    async fn play_rejects_missing_xphone_call() {
         let state = test_state();
         state
             .calls
@@ -1271,7 +1271,7 @@ mod tests {
             .await
             .unwrap();
 
-        // No xphone call → NOT_FOUND (from get_xphone_call)
+        // Call exists in calls registry but not in xphone_calls → NOT_FOUND
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
