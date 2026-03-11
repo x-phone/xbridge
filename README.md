@@ -419,6 +419,18 @@ For production deployments that need call recordings, CDR storage, billing, or d
 
 This separation keeps xbridge fast and simple — it never touches disk for call data — while letting you build whatever persistence and business logic you need on top.
 
+## Demo
+
+Run the **[Echo Bot Demo](demo/)** to test the full pipeline in under 2 minutes:
+
+```bash
+cd demo
+# Edit config.yaml with your SIP credentials
+docker compose up --build
+```
+
+Call your SIP number and hear your voice echoed back. Press `*` to hang up via the REST API.
+
 ## Integration Guide
 
 See the **[Integration Guide](docs/guide.md)** for a step-by-step walkthrough of building an AI voice agent with xbridge, including Python code examples, Twilio migration instructions, and a production checklist.
