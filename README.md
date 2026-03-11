@@ -21,10 +21,28 @@ xbridge connects SIP trunks to your application via WebSocket (audio) + REST (ca
 ### With Docker
 
 ```bash
+docker run -v ./config.yaml:/etc/xbridge/config.yaml \
+  -p 8080:8080 -p 10000-20000:10000-20000/udp \
+  ghcr.io/x-phone/xbridge:latest
+```
+
+Or with docker compose:
+
+```bash
 cp config.example.yaml config.yaml
 # Edit config.yaml with your SIP credentials and webhook URL
 
 docker compose up
+```
+
+### Pre-built Binaries
+
+Download from [GitHub Releases](https://github.com/x-phone/xbridge/releases) for Linux and macOS (amd64/arm64):
+
+```bash
+curl -L https://github.com/x-phone/xbridge/releases/latest/download/xbridge-linux-amd64 -o xbridge
+chmod +x xbridge
+./xbridge --config config.yaml
 ```
 
 ### From Source
