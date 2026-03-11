@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::api::{
-    CallListResponse, CreateCallRequest, CreateCallResponse, DtmfRequest, TransferRequest,
+    CallListResponse, CreateCallRequest, CreateCallResponse, DtmfRequest, PlayRequest,
+    PlayResponse, TransferRequest,
 };
 use crate::audio;
 use crate::bridge;
@@ -41,6 +42,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/calls/{call_id}/dtmf", post(send_dtmf))
         .route("/v1/calls/{call_id}/mute", post(mute_call))
         .route("/v1/calls/{call_id}/unmute", post(unmute_call))
+        .route("/v1/calls/{call_id}/play", post(play_call))
+        .route("/v1/calls/{call_id}/play/stop", post(stop_play))
         .route(
             "/v1/webhooks/failures",
             get(list_webhook_failures).delete(drain_webhook_failures),
@@ -421,6 +424,140 @@ async fn unmute_call(
     StatusCode::OK
 }
 
+async fn play_call(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+    Json(req): Json<PlayRequest>,
+) -> Result<Json<PlayResponse>, StatusCode> {
+    let call = get_xphone_call(&state, &call_id).await?;
+
+    // Resolve PCM audio from request
+    let pcm_data = match (&req.url, &req.audio) {
+        (Some(url), _) => {
+            let bytes = reqwest::get(url)
+                .await
+                .map_err(|e| {
+                    tracing::error!("failed to fetch audio from {url}: {e}");
+                    StatusCode::BAD_REQUEST
+                })?
+                .bytes()
+                .await
+                .map_err(|e| {
+                    tracing::error!("failed to read audio body from {url}: {e}");
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            let (header, data) = crate::wav::parse_wav(&bytes).map_err(|e| {
+                tracing::error!("WAV parse error: {e}");
+                StatusCode::BAD_REQUEST
+            })?;
+            crate::wav::ensure_8khz_mono_16bit(&header).map_err(|e| {
+                tracing::error!("WAV format error: {e}");
+                StatusCode::BAD_REQUEST
+            })?;
+
+            audio::bytes_to_pcm16(data)
+        }
+        (None, Some(b64)) => {
+            let b64_engine = base64::engine::general_purpose::STANDARD;
+            let bytes = b64_engine.decode(b64).map_err(|e| {
+                tracing::error!("base64 decode error: {e}");
+                StatusCode::BAD_REQUEST
+            })?;
+            audio::bytes_to_pcm16(&bytes)
+        }
+        (None, None) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let Some(pcm_tx) = call.pcm_writer() else {
+        tracing::error!("call {call_id}: audio writer not available");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    // Cancel any existing playback on this call
+    if let Some(prev) = state.plays.write().await.remove(&call_id) {
+        prev.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        prev.task.abort();
+    }
+
+    let play_id = format!(
+        "play_{}",
+        state
+            .play_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_flag = cancel.clone();
+    let pid = play_id.clone();
+    let cid = call_id.clone();
+    let webhook = state.webhook.clone();
+    let loop_count = req.loop_count;
+
+    let task = tokio::task::spawn_blocking(move || {
+        let frame_size = 160; // 20ms at 8kHz
+        let frame_duration = std::time::Duration::from_millis(20);
+        let loops = if loop_count == 0 { u32::MAX } else { loop_count };
+
+        for _ in 0..loops {
+            for chunk in pcm_data.chunks(frame_size) {
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return true; // interrupted
+                }
+                let frame = chunk.to_vec();
+                if pcm_tx.send(frame).is_err() {
+                    return true; // call ended
+                }
+                std::thread::sleep(frame_duration);
+            }
+        }
+        false // completed naturally
+    });
+
+    let plays = state.plays.clone();
+    let pid_done = pid.clone();
+    let cid_done = cid.clone();
+
+    // Wrapper task that waits for completion and fires webhook
+    let handle = tokio::spawn(async move {
+        let interrupted = task.await.unwrap_or(true);
+        plays.write().await.remove(&cid_done);
+        webhook
+            .send_event(&WebhookEvent::PlayFinished {
+                call_id: cid_done,
+                play_id: pid_done,
+                interrupted,
+            })
+            .await;
+    });
+
+    state.plays.write().await.insert(
+        call_id,
+        crate::state::PlayHandle {
+            cancel,
+            task: handle,
+        },
+    );
+
+    Ok(Json(PlayResponse { play_id: pid }))
+}
+
+async fn stop_play(
+    State(state): State<AppState>,
+    Path(call_id): Path<String>,
+) -> StatusCode {
+    if let Some(handle) = state.plays.write().await.remove(&call_id) {
+        handle
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The wrapper task will fire the play_finished webhook with interrupted=true
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 async fn list_webhook_failures(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
@@ -442,13 +579,8 @@ async fn ws_handler(
 ) -> Result<impl IntoResponse, StatusCode> {
     let call = get_xphone_call(&state, &call_id).await?;
 
-    let mode = state.config.stream.mode.clone();
-    let encoding = state.config.stream.encoding.clone();
-    let sample_rate = state.config.stream.sample_rate;
-    let metrics = state.metrics.clone();
-
     Ok(ws.on_upgrade(move |socket| {
-        handle_ws(socket, call_id, call, mode, encoding, sample_rate, metrics)
+        handle_ws(socket, call_id, call, state)
     }))
 }
 
@@ -456,11 +588,14 @@ async fn handle_ws(
     socket: WebSocket,
     call_id: String,
     call: Arc<xphone::Call>,
-    mode: StreamMode,
-    encoding: AudioEncoding,
-    sample_rate: u32,
-    metrics: crate::metrics::Metrics,
+    state: AppState,
 ) {
+    let mode = state.config.stream.mode.clone();
+    let encoding = state.config.stream.encoding.clone();
+    let sample_rate = state.config.stream.sample_rate;
+    let metrics = state.metrics.clone();
+    let ws_senders = state.ws_senders.clone();
+
     metrics.inc_ws_connections();
 
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -510,6 +645,14 @@ async fn handle_ws(
     };
 
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Message>(64);
+
+    // Register WS sender so DTMF callbacks can forward events
+    if let Ok(mut senders) = ws_senders.write() {
+        senders.insert(call_id.clone(), audio_tx.clone());
+    }
+
+    let cid_cleanup = call_id.clone();
+    let mark_tx = audio_tx.clone();
 
     // Blocking reader: pcm_rx → audio_tx
     let reader_mode = mode.clone();
@@ -611,7 +754,20 @@ async fn handle_ws(
                                     let _ = pcm_tx.try_send(pcm);
                                 }
                             }
-                            ClientEvent::Clear { .. } | ClientEvent::Mark { .. } => {}
+                            ClientEvent::Mark {
+                                stream_sid, mark, ..
+                            } => {
+                                // Echo mark back as confirmation
+                                let echo = crate::ws::ServerEvent::Mark {
+                                    stream_sid,
+                                    mark,
+                                };
+                                if let Ok(json) = serde_json::to_string(&echo) {
+                                    let _ =
+                                        mark_tx.send(Message::Text(json.into())).await;
+                                }
+                            }
+                            ClientEvent::Clear { .. } => {}
                         }
                     }
                 }
@@ -626,6 +782,11 @@ async fn handle_ws(
         _ = &mut reader_handle => { sender_handle.abort(); receiver_handle.abort(); },
         _ = &mut sender_handle => { reader_handle.abort(); receiver_handle.abort(); },
         _ = &mut receiver_handle => { reader_handle.abort(); sender_handle.abort(); },
+    }
+
+    // Deregister WS sender
+    if let Ok(mut senders) = ws_senders.write() {
+        senders.remove(&cid_cleanup);
     }
     metrics.dec_ws_connections();
 }
@@ -1051,6 +1212,66 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Play audio ──
+
+    #[tokio::test]
+    async fn play_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"audio":"AAAA","loop_count":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn play_stop_not_found() {
+        let resp = app(test_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/nonexistent/play/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn play_requires_audio_source() {
+        let state = test_state();
+        state
+            .calls
+            .write()
+            .await
+            .insert("c1".into(), sample_call("c1"));
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"loop_count":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No xphone call → NOT_FOUND (from get_xphone_call)
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

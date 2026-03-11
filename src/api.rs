@@ -72,6 +72,27 @@ pub enum IncomingCallAction {
     Reject,
 }
 
+// ── POST /v1/calls/{id}/play ──
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlayRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
+    #[serde(default = "default_loop_count")]
+    pub loop_count: u32,
+}
+
+fn default_loop_count() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlayResponse {
+    pub play_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

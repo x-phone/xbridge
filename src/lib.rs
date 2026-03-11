@@ -8,4 +8,5 @@ pub mod router;
 pub mod state;
 pub mod webhook;
 pub mod webhook_client;
+pub mod wav;
 pub mod ws;

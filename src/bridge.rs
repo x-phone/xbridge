@@ -254,11 +254,30 @@ pub(crate) fn wire_call_callbacks(
         let _ = ended_tx.blocking_send((cid.clone(), reason, duration));
     });
 
-    // Wire DTMF callback
+    // Wire DTMF callback — sends via both webhook channel and active WebSocket
     let cid = call_id.to_string();
     let dtmf_tx = state.dtmf_tx.clone();
+    let ws_senders = state.ws_senders.clone();
     call.on_dtmf(move |digit: String| {
-        let _ = dtmf_tx.blocking_send((cid.clone(), digit));
+        // Forward to webhook drain task
+        let _ = dtmf_tx.blocking_send((cid.clone(), digit.clone()));
+
+        // Forward to active WebSocket (if connected)
+        if let Ok(senders) = ws_senders.read() {
+            if let Some(ws_tx) = senders.get(&cid) {
+                let event = crate::ws::ServerEvent::Dtmf {
+                    stream_sid: cid.clone(),
+                    dtmf: crate::ws::DtmfPayload {
+                        digit: digit.clone(),
+                    },
+                };
+                if let Ok(json) = serde_json::to_string(&event) {
+                    let _ = ws_tx.blocking_send(
+                        axum::extract::ws::Message::Text(json.into()),
+                    );
+                }
+            }
+        }
     });
 }
 

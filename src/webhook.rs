@@ -28,6 +28,13 @@ pub enum WebhookEvent {
 
     #[serde(rename = "call.resumed")]
     Resumed { call_id: String },
+
+    #[serde(rename = "call.play_finished")]
+    PlayFinished {
+        call_id: String,
+        play_id: String,
+        interrupted: bool,
+    },
 }
 
 #[cfg(test)]
@@ -122,6 +129,23 @@ mod tests {
     }
 
     #[test]
+    fn play_finished_matches_spec() {
+        let event = WebhookEvent::PlayFinished {
+            call_id: "abc123".into(),
+            play_id: "play_0".into(),
+            interrupted: false,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "call.play_finished");
+        assert_eq!(json["call_id"], "abc123");
+        assert_eq!(json["play_id"], "play_0");
+        assert_eq!(json["interrupted"], false);
+
+        let back: WebhookEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
     fn deserialize_all_events_from_raw_json() {
         let cases = vec![
             r#"{"event":"call.ringing","call_id":"c1","from":"+1","to":"+2"}"#,
@@ -130,6 +154,7 @@ mod tests {
             r##"{"event":"call.dtmf","call_id":"c1","digit":"#"}"##,
             r#"{"event":"call.hold","call_id":"c1"}"#,
             r#"{"event":"call.resumed","call_id":"c1"}"#,
+            r#"{"event":"call.play_finished","call_id":"c1","play_id":"play_0","interrupted":false}"#,
         ];
         for raw in cases {
             let event: WebhookEvent = serde_json::from_str(raw).unwrap();

@@ -172,6 +172,44 @@ POST /v1/calls/{call_id}/mute
 POST /v1/calls/{call_id}/unmute
 ```
 
+### Play Audio
+
+```
+POST /v1/calls/{call_id}/play
+```
+
+```json
+{
+  "url": "https://example.com/greeting.wav",
+  "loop_count": 1
+}
+```
+
+Or with inline base64 PCM (8kHz mono 16-bit LE):
+
+```json
+{
+  "audio": "<base64-encoded PCM>",
+  "loop_count": 0
+}
+```
+
+`loop_count: 0` loops forever (useful for hold music). WAV files must be 8kHz mono 16-bit PCM.
+
+Response:
+
+```json
+{"play_id": "play_0"}
+```
+
+Stop playback:
+
+```
+POST /v1/calls/{call_id}/play/stop
+```
+
+A `call.play_finished` webhook is fired when playback completes or is interrupted.
+
 ### Webhook Failures (Dead Letter Queue)
 
 Events that fail delivery after all retries are stored in an in-memory dead letter queue (max 1000 entries).
@@ -215,8 +253,12 @@ Server sends JSON text frames:
 {"event": "connected", "protocol": "Call", "version": "1.0.0"}
 {"event": "start", "streamSid": "call_id", "start": {"callSid": "call_id", "tracks": ["inbound"], "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1}}}
 {"event": "media", "streamSid": "call_id", "media": {"timestamp": "0", "payload": "<base64>"}}
+{"event": "dtmf", "streamSid": "call_id", "dtmf": {"digit": "5"}}
+{"event": "mark", "streamSid": "call_id", "mark": {"name": "utterance_end"}}
 {"event": "stop", "streamSid": "call_id"}
 ```
+
+DTMF digits are delivered both as WebSocket events (for real-time agent processing) and as webhooks (for control plane logging). Mark events are echoed back when the client sends a mark.
 
 Client sends:
 
@@ -275,6 +317,7 @@ Events are POSTed to `{webhook_url}`:
 | `call.dtmf` | `call_id`, `digit` |
 | `call.hold` | `call_id` |
 | `call.resumed` | `call_id` |
+| `call.play_finished` | `call_id`, `play_id`, `interrupted` |
 
 ### Retry and Dead Letter Queue
 

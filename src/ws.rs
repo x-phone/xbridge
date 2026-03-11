@@ -27,6 +27,25 @@ pub enum ServerEvent {
         #[serde(rename = "streamSid")]
         stream_sid: String,
     },
+
+    #[serde(rename = "dtmf")]
+    Dtmf {
+        #[serde(rename = "streamSid")]
+        stream_sid: String,
+        dtmf: DtmfPayload,
+    },
+
+    #[serde(rename = "mark")]
+    Mark {
+        #[serde(rename = "streamSid")]
+        stream_sid: String,
+        mark: MarkPayload,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DtmfPayload {
+    pub digit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -306,6 +325,40 @@ mod tests {
                 version: "1.0.0".into(),
             }
         );
+    }
+
+    #[test]
+    fn server_dtmf_matches_spec() {
+        let event = ServerEvent::Dtmf {
+            stream_sid: "call_001".into(),
+            dtmf: DtmfPayload {
+                digit: "5".into(),
+            },
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "dtmf");
+        assert_eq!(json["streamSid"], "call_001");
+        assert_eq!(json["dtmf"]["digit"], "5");
+
+        let back: ServerEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn server_mark_matches_spec() {
+        let event = ServerEvent::Mark {
+            stream_sid: "call_001".into(),
+            mark: MarkPayload {
+                name: "utterance_end".into(),
+            },
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "mark");
+        assert_eq!(json["streamSid"], "call_001");
+        assert_eq!(json["mark"]["name"], "utterance_end");
+
+        let back: ServerEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event, back);
     }
 
     #[test]
