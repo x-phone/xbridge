@@ -19,7 +19,10 @@ impl fmt::Display for ConfigError {
             Self::Yaml(e) => write!(f, "YAML parse error: {e}"),
             Self::Toml(e) => write!(f, "TOML parse error: {e}"),
             Self::UnsupportedFormat(ext) => {
-                write!(f, "unsupported config format: .{ext} (expected .yaml, .yml, or .toml)")
+                write!(
+                    f,
+                    "unsupported config format: .{ext} (expected .yaml, .yml, or .toml)"
+                )
             }
         }
     }
@@ -259,10 +262,7 @@ impl Config {
     /// Parse config from a file, detecting format by extension.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
             "yaml" | "yml" => Self::from_yaml(&content),
             "toml" => Self::from_toml(&content),
@@ -671,11 +671,7 @@ sample_rate = 16000
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        move |key: &str| {
-            map.get(key)
-                .cloned()
-                .ok_or(std::env::VarError::NotPresent)
-        }
+        move |key: &str| map.get(key).cloned().ok_or(std::env::VarError::NotPresent)
     }
 
     #[test]

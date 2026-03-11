@@ -33,10 +33,7 @@ pub fn app(state: AppState) -> Router {
     let api_routes = Router::new()
         .route("/ws/{call_id}", get(ws_handler))
         .route("/v1/calls", get(list_calls).post(create_call))
-        .route(
-            "/v1/calls/{call_id}",
-            get(get_call).delete(hangup_call),
-        )
+        .route("/v1/calls/{call_id}", get(get_call).delete(hangup_call))
         .route("/v1/calls/{call_id}/hold", post(hold_call))
         .route("/v1/calls/{call_id}/resume", post(resume_call))
         .route("/v1/calls/{call_id}/transfer", post(transfer_call))
@@ -49,7 +46,10 @@ pub fn app(state: AppState) -> Router {
             "/v1/webhooks/failures",
             get(list_webhook_failures).delete(drain_webhook_failures),
         )
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             rate_limiter,
             rate_limit_middleware,
@@ -184,10 +184,7 @@ async fn get_call(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn hangup_call(
-    State(state): State<AppState>,
-    Path(call_id): Path<String>,
-) -> StatusCode {
+async fn hangup_call(State(state): State<AppState>, Path(call_id): Path<String>) -> StatusCode {
     // Remove xphone call first, then end it outside the lock
     let xphone_call = state.xphone_calls.write().await.remove(&call_id);
     if let Some(xphone_call) = xphone_call {
@@ -252,10 +249,11 @@ async fn create_call(
     };
 
     state.calls.write().await.insert(call_id.clone(), info);
-    state.xphone_calls.write().await.insert(
-        call_id.clone(),
-        Arc::new(XphoneCall(call.clone())),
-    );
+    state
+        .xphone_calls
+        .write()
+        .await
+        .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
 
     state.metrics.inc_calls_total();
     state.metrics.inc_calls_outbound();
@@ -292,10 +290,7 @@ async fn get_xphone_call(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn hold_call(
-    State(state): State<AppState>,
-    Path(call_id): Path<String>,
-) -> StatusCode {
+async fn hold_call(State(state): State<AppState>, Path(call_id): Path<String>) -> StatusCode {
     let call = match get_xphone_call(&state, &call_id).await {
         Ok(c) => c,
         Err(s) => return s,
@@ -317,10 +312,7 @@ async fn hold_call(
     StatusCode::OK
 }
 
-async fn resume_call(
-    State(state): State<AppState>,
-    Path(call_id): Path<String>,
-) -> StatusCode {
+async fn resume_call(State(state): State<AppState>, Path(call_id): Path<String>) -> StatusCode {
     let call = match get_xphone_call(&state, &call_id).await {
         Ok(c) => c,
         Err(s) => return s,
@@ -336,9 +328,7 @@ async fn resume_call(
     }
     let webhook = state.webhook.clone();
     tokio::spawn(async move {
-        webhook
-            .send_event(&WebhookEvent::Resumed { call_id })
-            .await;
+        webhook.send_event(&WebhookEvent::Resumed { call_id }).await;
     });
 
     StatusCode::OK
@@ -390,10 +380,7 @@ async fn send_dtmf(
     }
 }
 
-async fn mute_call(
-    State(state): State<AppState>,
-    Path(call_id): Path<String>,
-) -> StatusCode {
+async fn mute_call(State(state): State<AppState>, Path(call_id): Path<String>) -> StatusCode {
     let call = match get_xphone_call(&state, &call_id).await {
         Ok(c) => c,
         Err(s) => return s,
@@ -407,10 +394,7 @@ async fn mute_call(
     StatusCode::OK
 }
 
-async fn unmute_call(
-    State(state): State<AppState>,
-    Path(call_id): Path<String>,
-) -> StatusCode {
+async fn unmute_call(State(state): State<AppState>, Path(call_id): Path<String>) -> StatusCode {
     let call = match get_xphone_call(&state, &call_id).await {
         Ok(c) => c,
         Err(s) => return s,
@@ -498,7 +482,11 @@ async fn play_call(
     let task = tokio::task::spawn_blocking(move || {
         let frame_size = 160; // 20ms at 8kHz
         let frame_duration = std::time::Duration::from_millis(20);
-        let loops = if loop_count == 0 { u32::MAX } else { loop_count };
+        let loops = if loop_count == 0 {
+            u32::MAX
+        } else {
+            loop_count
+        };
 
         for _ in 0..loops {
             for chunk in pcm_data.chunks(frame_size) {
@@ -543,10 +531,7 @@ async fn play_call(
     Ok(Json(PlayResponse { play_id: pid }))
 }
 
-async fn stop_play(
-    State(state): State<AppState>,
-    Path(call_id): Path<String>,
-) -> StatusCode {
+async fn stop_play(State(state): State<AppState>, Path(call_id): Path<String>) -> StatusCode {
     if let Some(handle) = state.plays.write().await.remove(&call_id) {
         handle
             .cancel
@@ -558,16 +543,12 @@ async fn stop_play(
     }
 }
 
-async fn list_webhook_failures(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn list_webhook_failures(State(state): State<AppState>) -> Json<serde_json::Value> {
     let failures = state.webhook.dlq_list();
     Json(serde_json::json!({ "failures": failures }))
 }
 
-async fn drain_webhook_failures(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn drain_webhook_failures(State(state): State<AppState>) -> Json<serde_json::Value> {
     let failures = state.webhook.dlq_drain();
     Json(serde_json::json!({ "drained": failures.len() }))
 }
@@ -579,9 +560,7 @@ async fn ws_handler(
 ) -> Result<impl IntoResponse, StatusCode> {
     let call = get_xphone_call(&state, &call_id).await?;
 
-    Ok(ws.on_upgrade(move |socket| {
-        handle_ws(socket, call_id, call, state)
-    }))
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, call_id, call, state)))
 }
 
 async fn handle_ws(
@@ -670,12 +649,8 @@ async fn handle_ws(
                 while let Ok(frame) = pcm_rx.recv() {
                     encode_buf.clear();
                     match encoding_reader {
-                        AudioEncoding::Mulaw => {
-                            audio::pcm16_to_mulaw_into(&frame, &mut encode_buf)
-                        }
-                        AudioEncoding::L16 => {
-                            audio::pcm16_to_bytes_into(&frame, &mut encode_buf)
-                        }
+                        AudioEncoding::Mulaw => audio::pcm16_to_mulaw_into(&frame, &mut encode_buf),
+                        AudioEncoding::L16 => audio::pcm16_to_bytes_into(&frame, &mut encode_buf),
                     };
                     let payload = b64.encode(&encode_buf);
 
@@ -700,7 +675,9 @@ async fn handle_ws(
                     encode_buf.clear();
                     audio::pcm16_to_bytes_into(&frame, &mut encode_buf);
                     if let Some(binary) = crate::ws::encode_native_audio(&encode_buf) {
-                        if audio_tx.blocking_send(Message::Binary(binary.into())).is_err()
+                        if audio_tx
+                            .blocking_send(Message::Binary(binary.into()))
+                            .is_err()
                         {
                             break;
                         }
@@ -744,12 +721,8 @@ async fn handle_ws(
                             ClientEvent::Media { media, .. } => {
                                 if let Ok(bytes) = b64.decode(&media.payload) {
                                     let pcm = match encoding {
-                                        AudioEncoding::Mulaw => {
-                                            audio::mulaw_to_pcm16(&bytes)
-                                        }
-                                        AudioEncoding::L16 => {
-                                            audio::bytes_to_pcm16(&bytes)
-                                        }
+                                        AudioEncoding::Mulaw => audio::mulaw_to_pcm16(&bytes),
+                                        AudioEncoding::L16 => audio::bytes_to_pcm16(&bytes),
                                     };
                                     let _ = pcm_tx.try_send(pcm);
                                 }
@@ -758,13 +731,9 @@ async fn handle_ws(
                                 stream_sid, mark, ..
                             } => {
                                 // Echo mark back as confirmation
-                                let echo = crate::ws::ServerEvent::Mark {
-                                    stream_sid,
-                                    mark,
-                                };
+                                let echo = crate::ws::ServerEvent::Mark { stream_sid, mark };
                                 if let Ok(json) = serde_json::to_string(&echo) {
-                                    let _ =
-                                        mark_tx.send(Message::Text(json.into())).await;
+                                    let _ = mark_tx.send(Message::Text(json.into())).await;
                                 }
                             }
                             ClientEvent::Clear { .. } => {}
@@ -858,9 +827,7 @@ mod tests {
         }
     }
 
-    async fn body_json<T: serde::de::DeserializeOwned>(
-        resp: axum::http::Response<Body>,
-    ) -> T {
+    async fn body_json<T: serde::de::DeserializeOwned>(resp: axum::http::Response<Body>) -> T {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
     }
@@ -934,7 +901,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/plain"));
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
@@ -1077,15 +1049,13 @@ mod tests {
     #[tokio::test]
     async fn ws_upgrade_success() {
         let state = test_state();
-        let (mock, _play_rx, _audio_tx) =
-            crate::call_control::mock::MockCall::with_pcm_channels();
+        let (mock, _play_rx, _audio_tx) = crate::call_control::mock::MockCall::with_pcm_channels();
         insert_mock_call_custom(&state, "c1", mock).await;
         let addr = spawn_server(state).await;
 
-        let (mut ws, resp) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws/c1"))
-                .await
-                .unwrap();
+        let (mut ws, resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/c1"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 101u16);
 
         // Should receive "connected" event
@@ -1130,9 +1100,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/calls")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"to":"+15551234567","from":"+15559876543"}"#,
-                    ))
+                    .body(Body::from(r#"{"to":"+15551234567","from":"+15559876543"}"#))
                     .unwrap(),
             )
             .await
@@ -1144,10 +1112,17 @@ mod tests {
     // ── Call control endpoints ──
 
     /// Insert a MockCall into both registries, returning the Arc<MockCall> for assertions.
-    async fn insert_mock_call(state: &AppState, id: &str) -> Arc<crate::call_control::mock::MockCall> {
+    async fn insert_mock_call(
+        state: &AppState,
+        id: &str,
+    ) -> Arc<crate::call_control::mock::MockCall> {
         let mock = Arc::new(crate::call_control::mock::MockCall::default());
         state.calls.write().await.insert(id.into(), sample_call(id));
-        state.xphone_calls.write().await.insert(id.into(), mock.clone());
+        state
+            .xphone_calls
+            .write()
+            .await
+            .insert(id.into(), mock.clone());
         mock
     }
 
@@ -1159,7 +1134,11 @@ mod tests {
     ) -> Arc<crate::call_control::mock::MockCall> {
         let mock = Arc::new(mock);
         state.calls.write().await.insert(id.into(), sample_call(id));
-        state.xphone_calls.write().await.insert(id.into(), mock.clone());
+        state
+            .xphone_calls
+            .write()
+            .await
+            .insert(id.into(), mock.clone());
         mock
     }
 
@@ -1591,8 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn play_base64_success() {
         let state = test_state();
-        let (mock, _play_rx, _audio_tx) =
-            crate::call_control::mock::MockCall::with_pcm_channels();
+        let (mock, _play_rx, _audio_tx) = crate::call_control::mock::MockCall::with_pcm_channels();
         insert_mock_call_custom(&state, "c1", mock).await;
 
         // 4 bytes of raw PCM = 2 samples
@@ -1620,8 +1598,7 @@ mod tests {
     #[tokio::test]
     async fn play_no_audio_source_returns_400() {
         let state = test_state();
-        let (mock, _play_rx, _audio_tx) =
-            crate::call_control::mock::MockCall::with_pcm_channels();
+        let (mock, _play_rx, _audio_tx) = crate::call_control::mock::MockCall::with_pcm_channels();
         insert_mock_call_custom(&state, "c1", mock).await;
 
         let resp = app(state)
@@ -1807,11 +1784,10 @@ mod tests {
     async fn create_call_unknown_trunk_returns_404() {
         let state = test_state();
         // Insert a phone so phones isn't empty (otherwise we'd get 503)
-        state
-            .phones
-            .write()
-            .await
-            .insert("default".into(), xphone::Phone::new(xphone::Config::default()));
+        state.phones.write().await.insert(
+            "default".into(),
+            xphone::Phone::new(xphone::Config::default()),
+        );
 
         let resp = app(state)
             .oneshot(

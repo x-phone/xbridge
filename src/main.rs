@@ -11,9 +11,7 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config_path = std::env::args()
-        .skip_while(|a| a != "--config")
-        .nth(1);
+    let config_path = std::env::args().skip_while(|a| a != "--config").nth(1);
 
     let config = Config::load(config_path.as_deref().map(Path::new)).unwrap_or_else(|e| {
         eprintln!("failed to load config: {e}");

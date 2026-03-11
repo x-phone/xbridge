@@ -98,7 +98,10 @@ mod tests {
             digit: "5".into(),
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json, json!({"event": "call.dtmf", "call_id": "abc123", "digit": "5"}));
+        assert_eq!(
+            json,
+            json!({"event": "call.dtmf", "call_id": "abc123", "digit": "5"})
+        );
 
         let back: WebhookEvent = serde_json::from_value(json).unwrap();
         assert_eq!(event, back);

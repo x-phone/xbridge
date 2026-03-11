@@ -291,7 +291,12 @@ mod tests {
         assert_eq!(client.dlq_len(), DLQ_MAX_SIZE);
         // Oldest entries (c0..c4) should have been evicted
         let list = client.dlq_list();
-        assert_eq!(list[0].event, WebhookEvent::Answered { call_id: "c5".into() });
+        assert_eq!(
+            list[0].event,
+            WebhookEvent::Answered {
+                call_id: "c5".into()
+            }
+        );
     }
 
     #[test]

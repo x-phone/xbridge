@@ -142,10 +142,7 @@ pub(crate) mod mock {
         }
         fn blind_transfer(&self, target: &str) -> Result<(), CallError> {
             if self.transfer_ok {
-                self.transfer_log
-                    .lock()
-                    .unwrap()
-                    .push(target.to_string());
+                self.transfer_log.lock().unwrap().push(target.to_string());
                 Ok(())
             } else {
                 Err(mock_err("transfer failed"))

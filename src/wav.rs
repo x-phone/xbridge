@@ -30,7 +30,9 @@ impl fmt::Display for WavError {
             Self::InvalidWave => write!(f, "not a WAVE file"),
             Self::MissingFmt => write!(f, "missing fmt chunk"),
             Self::MissingData => write!(f, "missing data chunk"),
-            Self::UnsupportedFormat(tag) => write!(f, "unsupported audio format: {tag} (expected PCM/1)"),
+            Self::UnsupportedFormat(tag) => {
+                write!(f, "unsupported audio format: {tag} (expected PCM/1)")
+            }
             Self::NotMono => write!(f, "only mono audio supported"),
             Self::Not8kHz(rate) => write!(f, "unsupported sample rate: {rate}Hz (expected 8000)"),
             Self::Not16Bit(bits) => write!(f, "unsupported bit depth: {bits} (expected 16)"),
@@ -201,7 +203,10 @@ mod tests {
         let mut wav = build_test_wav(&[0; 4]);
         // Set audio format to 3 (IEEE float) instead of 1 (PCM)
         wav[20..22].copy_from_slice(&3u16.to_le_bytes());
-        assert!(matches!(parse_wav(&wav), Err(WavError::UnsupportedFormat(3))));
+        assert!(matches!(
+            parse_wav(&wav),
+            Err(WavError::UnsupportedFormat(3))
+        ));
     }
 
     #[test]
@@ -211,7 +216,10 @@ mod tests {
             sample_rate: 8000,
             bits_per_sample: 16,
         };
-        assert!(matches!(ensure_8khz_mono_16bit(&header), Err(WavError::NotMono)));
+        assert!(matches!(
+            ensure_8khz_mono_16bit(&header),
+            Err(WavError::NotMono)
+        ));
     }
 
     #[test]

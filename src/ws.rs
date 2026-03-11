@@ -254,10 +254,7 @@ mod tests {
             stream_sid: "call_001".into(),
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(
-            json,
-            json!({"event": "clear", "streamSid": "call_001"})
-        );
+        assert_eq!(json, json!({"event": "clear", "streamSid": "call_001"}));
 
         let back: ClientEvent = serde_json::from_value(json).unwrap();
         assert_eq!(event, back);
@@ -331,9 +328,7 @@ mod tests {
     fn server_dtmf_matches_spec() {
         let event = ServerEvent::Dtmf {
             stream_sid: "call_001".into(),
-            dtmf: DtmfPayload {
-                digit: "5".into(),
-            },
+            dtmf: DtmfPayload { digit: "5".into() },
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["event"], "dtmf");

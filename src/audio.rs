@@ -56,7 +56,11 @@ fn decode_sample(mulaw: u8) -> i16 {
     let magnitude = ((mantissa << 1) | 0x21) << (exponent + 2);
     let sample = magnitude as i16 - MULAW_BIAS as i16;
 
-    if sign { -sample } else { sample }
+    if sign {
+        -sample
+    } else {
+        sample
+    }
 }
 
 /// Encode PCM16 samples to mu-law bytes.
@@ -118,10 +122,16 @@ mod tests {
             // For small values (<256), error should be <=4.
             // For large values, relative error should be <4%.
             if original.unsigned_abs() < 256 {
-                assert!(error <= 4, "sample={original}, decoded={decoded}, error={error}");
+                assert!(
+                    error <= 4,
+                    "sample={original}, decoded={decoded}, error={error}"
+                );
             } else {
                 let rel = error as f64 / original.unsigned_abs() as f64;
-                assert!(rel < 0.04, "sample={original}, decoded={decoded}, rel_error={rel}");
+                assert!(
+                    rel < 0.04,
+                    "sample={original}, decoded={decoded}, rel_error={rel}"
+                );
             }
         }
     }

@@ -62,11 +62,7 @@ pub async fn run(
         };
 
         tracing::info!("trunk '{}' connected", trunk_name);
-        state
-            .phones
-            .write()
-            .await
-            .insert(trunk_name, phone);
+        state.phones.write().await.insert(trunk_name, phone);
     }
 
     // Drop our copy so the channel closes when all phones drop theirs
@@ -120,11 +116,7 @@ pub async fn run(
                     };
                     state_state
                         .webhook
-                        .send_event(&WebhookEvent::Ringing {
-                            call_id,
-                            from,
-                            to,
-                        })
+                        .send_event(&WebhookEvent::Ringing { call_id, from, to })
                         .await;
                 }
                 xphone::CallState::Active => {
@@ -211,10 +203,11 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
             state.metrics.inc_calls_inbound();
 
             state.calls.write().await.insert(call_id.clone(), info);
-            state.xphone_calls.write().await.insert(
-                call_id.clone(),
-                Arc::new(XphoneCall(call.clone())),
-            );
+            state
+                .xphone_calls
+                .write()
+                .await
+                .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
 
             // Send call.answered webhook
             state
@@ -240,11 +233,7 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
 }
 
 /// Wire on_ended and on_dtmf callbacks for a call. Used by both inbound and outbound paths.
-pub(crate) fn wire_call_callbacks(
-    call: &Arc<xphone::Call>,
-    call_id: &str,
-    state: &AppState,
-) {
+pub(crate) fn wire_call_callbacks(call: &Arc<xphone::Call>, call_id: &str, state: &AppState) {
     // Wire call-ended callback
     let call_for_ended = call.clone();
     let cid = call_id.to_string();
@@ -269,9 +258,7 @@ pub(crate) fn wire_call_callbacks(
                     },
                 };
                 if let Ok(json) = serde_json::to_string(&event) {
-                    let _ = ws_tx.blocking_send(
-                        axum::extract::ws::Message::Text(json.into()),
-                    );
+                    let _ = ws_tx.blocking_send(axum::extract::ws::Message::Text(json.into()));
                 }
             }
         }

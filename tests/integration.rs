@@ -1,5 +1,3 @@
-use axum::body::Body;
-use http_body_util::BodyExt;
 use tokio::net::TcpListener;
 
 use xbridge::call::{CallDirection, CallInfo, CallStatus};
@@ -100,7 +98,12 @@ async fn metrics_returns_prometheus_text() {
     let resp = reqwest::get(format!("{base}/metrics")).await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.contains("text/plain"));
 
     let body = resp.text().await.unwrap();
@@ -310,20 +313,12 @@ async fn rate_limiting_returns_429() {
 
     // First 2 should pass (burst = 2x rate)
     for _ in 0..2 {
-        let resp = client
-            .get(format!("{base}/v1/calls"))
-            .send()
-            .await
-            .unwrap();
+        let resp = client.get(format!("{base}/v1/calls")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
     }
 
     // Third should be rate limited
-    let resp = client
-        .get(format!("{base}/v1/calls"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{base}/v1/calls")).send().await.unwrap();
     assert_eq!(resp.status(), 429);
 }
 
@@ -338,10 +333,7 @@ async fn rate_limiting_does_not_affect_health() {
 
     // Exhaust rate limit
     for _ in 0..5 {
-        let _ = client
-            .get(format!("{base}/v1/calls"))
-            .send()
-            .await;
+        let _ = client.get(format!("{base}/v1/calls")).send().await;
     }
 
     // Health should still work
@@ -382,15 +374,13 @@ async fn webhook_delivers_to_mock_server() {
 
     let mock_app = axum::Router::new().route(
         "/events",
-        axum::routing::post(
-            move |body: axum::Json<serde_json::Value>| {
-                let store = received_clone.clone();
-                async move {
-                    store.lock().await.push(body.0);
-                    axum::http::StatusCode::OK
-                }
-            },
-        ),
+        axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+            let store = received_clone.clone();
+            async move {
+                store.lock().await.push(body.0);
+                axum::http::StatusCode::OK
+            }
+        }),
     );
 
     let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
