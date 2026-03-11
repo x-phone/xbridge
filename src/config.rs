@@ -117,11 +117,11 @@ fn default_transport() -> SipTransport {
 }
 
 fn default_rtp_port_min() -> u16 {
-    10000
+    0
 }
 
 fn default_rtp_port_max() -> u16 {
-    20000
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -460,8 +460,8 @@ mod tests {
         let config: Config = serde_json::from_value(json).unwrap();
 
         assert_eq!(config.sip.transport, SipTransport::Udp);
-        assert_eq!(config.sip.rtp_port_min, 10000);
-        assert_eq!(config.sip.rtp_port_max, 20000);
+        assert_eq!(config.sip.rtp_port_min, 0);
+        assert_eq!(config.sip.rtp_port_max, 0);
         assert!(!config.sip.srtp);
         assert!(config.sip.stun_server.is_none());
         assert_eq!(config.webhook.timeout, "5s");
@@ -565,7 +565,7 @@ webhook:
     fn from_yaml_minimal_uses_defaults() {
         let config = Config::from_yaml(MINIMAL_YAML).unwrap();
         assert_eq!(config.sip.transport, SipTransport::Udp);
-        assert_eq!(config.sip.rtp_port_min, 10000);
+        assert_eq!(config.sip.rtp_port_min, 0);
         assert!(!config.sip.srtp);
         assert_eq!(config.webhook.timeout, "5s");
         assert_eq!(config.stream.mode, StreamMode::Twilio);
@@ -761,7 +761,7 @@ sample_rate = 16000
 
         // All should remain at defaults
         assert_eq!(config.sip.transport, SipTransport::Udp);
-        assert_eq!(config.sip.rtp_port_min, 10000);
+        assert_eq!(config.sip.rtp_port_min, 0);
         assert!(!config.sip.srtp);
         assert_eq!(config.stream.mode, StreamMode::Twilio);
         assert_eq!(config.stream.encoding, AudioEncoding::Mulaw);

@@ -26,7 +26,7 @@ xbridge connects SIP trunks to your application via WebSocket (audio) + REST (ca
 
 ```bash
 docker run -v ./config.yaml:/etc/xbridge/config.yaml \
-  -p 8080:8080 -p 10000-20000:10000-20000/udp \
+  -p 8080:8080 -p 10000-10100:10000-10100/udp \
   ghcr.io/x-phone/xbridge:latest
 ```
 
@@ -81,8 +81,8 @@ Every config field can be overridden via `XBRIDGE_*` environment variables:
 | `XBRIDGE_SIP_TRANSPORT` | `udp`, `tcp`, or `tls` |
 | `XBRIDGE_SIP_SRTP` | `true` or `false` |
 | `XBRIDGE_SIP_STUN_SERVER` | STUN server address |
-| `XBRIDGE_SIP_RTP_PORT_MIN` | RTP port range start (default: `10000`) |
-| `XBRIDGE_SIP_RTP_PORT_MAX` | RTP port range end (default: `20000`) |
+| `XBRIDGE_SIP_RTP_PORT_MIN` | RTP port range start (default: `0` = OS-assigned) |
+| `XBRIDGE_SIP_RTP_PORT_MAX` | RTP port range end (default: `0` = OS-assigned) |
 | `XBRIDGE_WEBHOOK_URL` | Webhook endpoint URL |
 | `XBRIDGE_WEBHOOK_TIMEOUT` | Webhook timeout (e.g. `5s`, `500ms`) |
 | `XBRIDGE_WEBHOOK_RETRY` | Webhook retry count |

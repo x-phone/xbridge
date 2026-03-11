@@ -7,8 +7,10 @@ sip:
   password: "your-sip-password"
   host: "sip.your-provider.com"
   transport: "udp"        # udp | tcp | tls
-  rtp_port_min: 10000
-  rtp_port_max: 20000
+  rtp_port_min: 0          # 0 = OS-assigned (dev/testing)
+  rtp_port_max: 0          # For production, use a fixed range:
+  # rtp_port_min: 10000    #   small:  10000–10100
+  # rtp_port_max: 10100    #   medium: 10000–20000
   srtp: false
   # stun_server: "stun.l.google.com:19302"
 

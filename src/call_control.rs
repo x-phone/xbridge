@@ -14,6 +14,7 @@ pub trait CallControl: Send + Sync {
     fn send_dtmf(&self, digit: &str) -> Result<(), CallError>;
     fn end(&self) -> Result<(), CallError>;
     fn pcm_writer(&self) -> Option<Sender<Vec<i16>>>;
+    fn paced_pcm_writer(&self) -> Option<Sender<Vec<i16>>>;
     fn pcm_reader(&self) -> Option<Receiver<Vec<i16>>>;
 }
 
@@ -48,6 +49,9 @@ impl CallControl for XphoneCall {
     }
     fn pcm_writer(&self) -> Option<Sender<Vec<i16>>> {
         self.0.pcm_writer()
+    }
+    fn paced_pcm_writer(&self) -> Option<Sender<Vec<i16>>> {
+        self.0.paced_pcm_writer()
     }
     fn pcm_reader(&self) -> Option<Receiver<Vec<i16>>> {
         self.0.pcm_reader()
@@ -164,6 +168,9 @@ pub(crate) mod mock {
             }
         }
         fn pcm_writer(&self) -> Option<Sender<Vec<i16>>> {
+            self.pcm_tx.clone()
+        }
+        fn paced_pcm_writer(&self) -> Option<Sender<Vec<i16>>> {
             self.pcm_tx.clone()
         }
         fn pcm_reader(&self) -> Option<Receiver<Vec<i16>>> {

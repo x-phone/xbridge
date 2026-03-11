@@ -467,7 +467,7 @@ async fn play_call(
         (None, None) => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let Some(pcm_tx) = call.pcm_writer() else {
+    let Some(pcm_tx) = call.paced_pcm_writer() else {
         tracing::error!("call {call_id}: audio writer not available");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -494,8 +494,6 @@ async fn play_call(
     let loop_count = req.loop_count;
 
     let task = tokio::task::spawn_blocking(move || {
-        let frame_size = 160; // 20ms at 8kHz
-        let frame_duration = std::time::Duration::from_millis(20);
         let loops = if loop_count == 0 {
             u32::MAX
         } else {
@@ -503,15 +501,12 @@ async fn play_call(
         };
 
         for _ in 0..loops {
-            for chunk in pcm_data.chunks(frame_size) {
-                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return true; // interrupted
-                }
-                let frame = chunk.to_vec();
-                if pcm_tx.send(frame).is_err() {
-                    return true; // call ended
-                }
-                std::thread::sleep(frame_duration);
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return true; // interrupted
+            }
+            // paced_pcm_writer handles chunking into codec frames and real-time pacing
+            if pcm_tx.send(pcm_data.clone()).is_err() {
+                return true; // call ended
             }
         }
         false // completed naturally
