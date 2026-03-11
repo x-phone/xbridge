@@ -397,6 +397,10 @@ For production deployments that need call recordings, CDR storage, billing, or d
 
 This separation keeps xbridge fast and simple — it never touches disk for call data — while letting you build whatever persistence and business logic you need on top.
 
+## Integration Guide
+
+See the **[Integration Guide](docs/guide.md)** for a step-by-step walkthrough of building an AI voice agent with xbridge, including Python code examples, Twilio migration instructions, and a production checklist.
+
 ## Development
 
 ```bash
