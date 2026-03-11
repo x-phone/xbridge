@@ -22,7 +22,7 @@ pub async fn run(
     }
 
     // Channel for incoming calls (shared across all trunks)
-    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Arc<xphone::Call>>(32);
+    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Arc<xphone::Call>>(256);
 
     // Connect each trunk
     for trunk in &trunks {
@@ -43,8 +43,11 @@ pub async fn run(
         });
 
         phone.on_incoming(move |call: Arc<xphone::Call>| {
-            if tx.blocking_send(call).is_err() {
-                tracing::error!("incoming call channel closed");
+            if let Err(e) = tx.try_send(call) {
+                tracing::error!("incoming call channel full or closed, rejecting call");
+                if let tokio::sync::mpsc::error::TrySendError::Full(rejected) = e {
+                    let _ = rejected.reject(503, "overloaded");
+                }
             }
         });
 
@@ -72,19 +75,33 @@ pub async fn run(
     let ended_state = state.clone();
     tokio::spawn(async move {
         while let Some((call_id, reason, duration)) = ended_rx.recv().await {
+            // Remove from all registries first, then send webhook without blocking the consumer
             ended_state.calls.write().await.remove(&call_id);
             ended_state.xphone_calls.write().await.remove(&call_id);
+            if let Ok(mut senders) = ended_state.ws_senders.write() {
+                senders.remove(&call_id);
+            }
+            // Cancel any active playback for this call
+            if let Some(handle) = ended_state.plays.write().await.remove(&call_id) {
+                handle
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                handle.task.abort();
+            }
 
             let reason_str = end_reason_str(reason);
 
-            ended_state
-                .webhook
-                .send_event(&WebhookEvent::Ended {
-                    call_id,
-                    reason: reason_str.to_string(),
-                    duration: duration.as_secs(),
-                })
-                .await;
+            // Spawn webhook delivery so the consumer can process the next event immediately
+            let webhook = ended_state.webhook.clone();
+            tokio::spawn(async move {
+                webhook
+                    .send_event(&WebhookEvent::Ended {
+                        call_id,
+                        reason: reason_str.to_string(),
+                        duration: duration.as_secs(),
+                    })
+                    .await;
+            });
         }
     });
 
@@ -202,12 +219,15 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
             state.metrics.inc_calls_total();
             state.metrics.inc_calls_inbound();
 
-            state.calls.write().await.insert(call_id.clone(), info);
-            state
-                .xphone_calls
-                .write()
-                .await
-                .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
+            // Insert into both registries (brief TOCTOU window between the two awaits)
+            {
+                state.calls.write().await.insert(call_id.clone(), info);
+                state
+                    .xphone_calls
+                    .write()
+                    .await
+                    .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
+            }
 
             // Send call.answered webhook
             state
@@ -240,7 +260,9 @@ pub(crate) fn wire_call_callbacks(call: &Arc<xphone::Call>, call_id: &str, state
     let ended_tx = state.ended_tx.clone();
     call.on_ended(move |reason: xphone::EndReason| {
         let duration = call_for_ended.duration();
-        let _ = ended_tx.blocking_send((cid.clone(), reason, duration));
+        if ended_tx.try_send((cid.clone(), reason, duration)).is_err() {
+            tracing::warn!("ended channel full, dropping event for {}", cid);
+        }
     });
 
     // Wire DTMF callback — sends via both webhook channel and active WebSocket
@@ -258,13 +280,15 @@ pub(crate) fn wire_call_callbacks(call: &Arc<xphone::Call>, call_id: &str, state
                     },
                 };
                 if let Ok(json) = serde_json::to_string(&event) {
-                    let _ = ws_tx.blocking_send(axum::extract::ws::Message::Text(json.into()));
+                    let _ = ws_tx.try_send(axum::extract::ws::Message::Text(json.into()));
                 }
             }
         }
 
         // Forward to webhook drain task (consumes digit)
-        let _ = dtmf_tx.blocking_send((cid.clone(), digit));
+        if dtmf_tx.try_send((cid.clone(), digit)).is_err() {
+            tracing::warn!("dtmf channel full, dropping event for {}", cid);
+        }
     });
 }
 
@@ -277,7 +301,9 @@ pub(crate) fn wire_outbound_state_callbacks(
     let cid = call_id.to_string();
     let state_tx = state.state_tx.clone();
     call.on_state(move |new_state: xphone::CallState| {
-        let _ = state_tx.blocking_send((cid.clone(), new_state));
+        if state_tx.try_send((cid.clone(), new_state)).is_err() {
+            tracing::warn!("state channel full, dropping event for {}", cid);
+        }
     });
 }
 

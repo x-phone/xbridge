@@ -1,6 +1,7 @@
 use crate::api::{IncomingCallResponse, IncomingCallWebhook};
 use crate::config::WebhookConfig;
 use crate::webhook::WebhookEvent;
+use rand::Rng;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -87,10 +88,13 @@ impl WebhookClient {
                 }
             }
 
-            // Exponential backoff before next retry (skip after last attempt)
+            // Exponential backoff with jitter before next retry (skip after last attempt)
             if attempt < attempts {
-                let delay = BACKOFF_BASE_MS * 2u64.saturating_pow(attempt - 1);
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let base = 2u64
+                    .saturating_pow(attempt - 1)
+                    .saturating_mul(BACKOFF_BASE_MS);
+                let jitter = rand::rng().random_range(0..=base / 2);
+                tokio::time::sleep(Duration::from_millis(base + jitter)).await;
             }
         }
 

@@ -191,12 +191,23 @@ async fn hangup_call(State(state): State<AppState>, Path(call_id): Path<String>)
         let _ = xphone_call.end();
     }
 
-    let mut calls = state.calls.write().await;
-    if calls.remove(&call_id).is_some() {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    let removed = state.calls.write().await.remove(&call_id).is_some();
+    if !removed {
+        return StatusCode::NOT_FOUND;
     }
+
+    // Clean up associated resources
+    if let Ok(mut senders) = state.ws_senders.write() {
+        senders.remove(&call_id);
+    }
+    if let Some(handle) = state.plays.write().await.remove(&call_id) {
+        handle
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.task.abort();
+    }
+
+    StatusCode::NO_CONTENT
 }
 
 async fn create_call(
@@ -248,12 +259,15 @@ async fn create_call(
         status: CallStatus::Dialing,
     };
 
-    state.calls.write().await.insert(call_id.clone(), info);
-    state
-        .xphone_calls
-        .write()
-        .await
-        .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
+    // Insert into both registries (brief TOCTOU window between the two awaits)
+    {
+        state.calls.write().await.insert(call_id.clone(), info);
+        state
+            .xphone_calls
+            .write()
+            .await
+            .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
+    }
 
     state.metrics.inc_calls_total();
     state.metrics.inc_calls_outbound();

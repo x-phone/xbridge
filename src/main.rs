@@ -21,9 +21,9 @@ async fn main() {
     let addr = config.listen.http.clone();
     let webhook = WebhookClient::new(&config.webhook);
 
-    let (ended_tx, ended_rx) = tokio::sync::mpsc::channel(32);
-    let (dtmf_tx, dtmf_rx) = tokio::sync::mpsc::channel(32);
-    let (state_tx, state_rx) = tokio::sync::mpsc::channel(32);
+    let (ended_tx, ended_rx) = tokio::sync::mpsc::channel(256);
+    let (dtmf_tx, dtmf_rx) = tokio::sync::mpsc::channel(256);
+    let (state_tx, state_rx) = tokio::sync::mpsc::channel(256);
 
     let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx, state_tx);
 
