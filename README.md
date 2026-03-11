@@ -1,5 +1,9 @@
 # xbridge
 
+[![CI](https://github.com/x-phone/xbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/x-phone/xbridge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/ghcr.io-x--phone%2Fxbridge-blue?logo=docker)](https://ghcr.io/x-phone/xbridge)
+
 Self-hosted voice gateway — WebSocket audio streaming and REST call control. Drop-in Twilio replacement powered by [xphone](https://github.com/x-phone/xphone).
 
 xbridge connects SIP trunks to your application via WebSocket (audio) + REST (call control), so you can build AI voice agents, IVRs, or call centers without vendor lock-in.
