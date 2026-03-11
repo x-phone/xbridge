@@ -13,8 +13,6 @@ services:
 
   echo-bot:
     build: .
-    ports:
-      - "3000:3000"
     environment:
       - XBRIDGE_HOST=xbridge:8080
       - DEMO_PORT=3000

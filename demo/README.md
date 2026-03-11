@@ -10,7 +10,7 @@ Caller → SIP → xbridge → WebSocket → echo-bot → WebSocket → xbridge 
 
 - A SIP trunk account (free tiers: [Telnyx](https://telnyx.com), [VoIP.ms](https://voip.ms), [Twilio](https://twilio.com))
 - Docker and Docker Compose
-- A SIP softphone for testing (e.g., [Location](https://location.com), [Zoiper](https://zoiper.com), or [Otwist](https://otwist.com))
+- A SIP softphone for testing (e.g., [Linphone](https://linphone.org), [Zoiper](https://zoiper.com), or [MicroSIP](https://microsip.org))
 
 ## Quick Start
 

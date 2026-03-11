@@ -143,7 +143,7 @@ async def handle_audio_stream(call_id: str):
     uri = f"ws://localhost:8080/ws/{call_id}"
     headers = {"Authorization": "Bearer your-secret-key"}
 
-    async with websockets.connect(uri, extra_headers=headers) as ws:
+    async with websockets.connect(uri, additional_headers=headers) as ws:
         async for message in ws:
             event = json.loads(message)
 
@@ -214,7 +214,7 @@ async def voice_agent(call_id: str):
     uri = f"ws://localhost:8080/ws/{call_id}"
     headers = {"Authorization": "Bearer your-secret-key"}
 
-    async with websockets.connect(uri, extra_headers=headers) as ws:
+    async with websockets.connect(uri, additional_headers=headers) as ws:
         async for message in ws:
             event = json.loads(message)
 

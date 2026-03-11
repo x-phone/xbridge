@@ -15,8 +15,6 @@ import asyncio
 import json
 import logging
 import os
-import signal
-import sys
 
 import httpx
 import uvicorn
@@ -40,6 +38,15 @@ app = FastAPI()
 # Track active WebSocket tasks so we can cancel on shutdown
 ws_tasks: dict[str, asyncio.Task] = {}
 
+# Shared HTTP client for REST API calls
+http_client = httpx.AsyncClient()
+
+
+def _auth_headers() -> dict[str, str]:
+    if XBRIDGE_API_KEY:
+        return {"Authorization": f"Bearer {XBRIDGE_API_KEY}"}
+    return {}
+
 
 # ── Webhook Endpoints ───────────────────────────────────────────────
 
@@ -48,7 +55,7 @@ ws_tasks: dict[str, asyncio.Task] = {}
 async def incoming_call(request: Request):
     """Handle incoming call webhook from xbridge."""
     body = await request.json()
-    call_id = body["call_id"]
+    call_id = body.get("call_id", "unknown")
     caller = body.get("from", "unknown")
     callee = body.get("to", "unknown")
 
@@ -67,6 +74,9 @@ async def call_events(request: Request):
 
     if event == "call.answered":
         log.info("Call %s answered — connecting WebSocket", call_id)
+        # Cancel any existing task for this call_id before starting a new one
+        if call_id in ws_tasks:
+            ws_tasks.pop(call_id).cancel()
         task = asyncio.create_task(echo_audio(call_id))
         ws_tasks[call_id] = task
     elif event == "call.ended":
@@ -74,8 +84,9 @@ async def call_events(request: Request):
         duration = body.get("duration", 0)
         log.info("Call %s ended  reason=%s  duration=%ss", call_id, reason, duration)
         # Cancel WS task if still running
-        if call_id in ws_tasks:
-            ws_tasks.pop(call_id).cancel()
+        task = ws_tasks.pop(call_id, None)
+        if task:
+            task.cancel()
     elif event == "call.dtmf":
         log.info("Call %s  DTMF: %s", call_id, body.get("digit", "?"))
     elif event == "call.play_finished":
@@ -97,12 +108,11 @@ async def call_events(request: Request):
 async def echo_audio(call_id: str):
     """Connect to xbridge WebSocket and echo audio back to the caller."""
     ws_url = f"ws://{XBRIDGE_HOST}/ws/{call_id}"
-    headers = {}
-    if XBRIDGE_API_KEY:
-        headers["Authorization"] = f"Bearer {XBRIDGE_API_KEY}"
 
     try:
-        async with websockets.connect(ws_url, additional_headers=headers) as ws:
+        async with websockets.connect(
+            ws_url, additional_headers=_auth_headers()
+        ) as ws:
             log.info("WebSocket connected for call %s", call_id)
 
             async for raw in ws:
@@ -155,43 +165,20 @@ async def echo_audio(call_id: str):
 async def hangup_call(call_id: str):
     """Hang up a call via the xbridge REST API."""
     url = f"http://{XBRIDGE_HOST}/v1/calls/{call_id}"
-    headers = {}
-    if XBRIDGE_API_KEY:
-        headers["Authorization"] = f"Bearer {XBRIDGE_API_KEY}"
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.delete(url, headers=headers)
+    try:
+        resp = await http_client.delete(url, headers=_auth_headers())
         if resp.status_code == 204:
             log.info("Hung up call %s", call_id)
         else:
             log.warning("Hangup failed for %s: HTTP %s", call_id, resp.status_code)
+    except httpx.HTTPError as e:
+        log.error("Hangup request failed for %s: %s", call_id, e)
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────
 
 
-def main():
+if __name__ == "__main__":
     log.info("xbridge echo bot starting on port %d", LISTEN_PORT)
     log.info("Expecting xbridge at %s", XBRIDGE_HOST)
-
-    config = uvicorn.Config(
-        app, host="0.0.0.0", port=LISTEN_PORT, log_level="warning"
-    )
-    server = uvicorn.Server(config)
-
-    loop = asyncio.new_event_loop()
-
-    def shutdown(*_):
-        log.info("Shutting down...")
-        for task in ws_tasks.values():
-            task.cancel()
-        server.should_exit = True
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-
-    loop.run_until_complete(server.serve())
-
-
-if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=LISTEN_PORT, log_level="warning")
