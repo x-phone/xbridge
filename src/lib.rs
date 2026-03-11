@@ -2,6 +2,7 @@ pub mod api;
 pub mod audio;
 pub mod bridge;
 pub mod call;
+pub mod call_control;
 pub mod config;
 pub mod metrics;
 pub mod router;

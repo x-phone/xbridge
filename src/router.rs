@@ -17,6 +17,7 @@ use crate::api::{
 use crate::audio;
 use crate::bridge;
 use crate::call::{CallDirection, CallInfo, CallStatus};
+use crate::call_control::{CallControl, CallError, XphoneCall};
 use crate::config::{AudioEncoding, StreamMode};
 use crate::state::AppState;
 use crate::webhook::WebhookEvent;
@@ -251,11 +252,10 @@ async fn create_call(
     };
 
     state.calls.write().await.insert(call_id.clone(), info);
-    state
-        .xphone_calls
-        .write()
-        .await
-        .insert(call_id.clone(), call.clone());
+    state.xphone_calls.write().await.insert(
+        call_id.clone(),
+        Arc::new(XphoneCall(call.clone())),
+    );
 
     state.metrics.inc_calls_total();
     state.metrics.inc_calls_outbound();
@@ -278,11 +278,11 @@ async fn create_call(
     }))
 }
 
-/// Helper to look up the xphone Call by ID.
+/// Helper to look up the call control interface by ID.
 async fn get_xphone_call(
     state: &AppState,
     call_id: &str,
-) -> Result<Arc<xphone::Call>, StatusCode> {
+) -> Result<Arc<dyn CallControl>, StatusCode> {
     state
         .xphone_calls
         .read()
@@ -376,7 +376,7 @@ async fn send_dtmf(
         for digit in req.digits.chars() {
             call.send_dtmf(&digit.to_string())?;
         }
-        Ok::<(), xphone::Error>(())
+        Ok::<(), CallError>(())
     })
     .await;
 
@@ -587,7 +587,7 @@ async fn ws_handler(
 async fn handle_ws(
     socket: WebSocket,
     call_id: String,
-    call: Arc<xphone::Call>,
+    call: Arc<dyn CallControl>,
     state: AppState,
 ) {
     let mode = state.config.stream.mode.clone();
@@ -1073,9 +1073,36 @@ mod tests {
     }
 
     // ── WebSocket /ws/{call_id} ──
-    // WS tests need xphone::Call objects which we can't easily mock.
-    // The upgrade/reject tests verify routing; audio streaming is
-    // tested via integration tests with a real SIP trunk.
+
+    #[tokio::test]
+    async fn ws_upgrade_success() {
+        let state = test_state();
+        let (mock, _play_rx, _audio_tx) =
+            crate::call_control::mock::MockCall::with_pcm_channels();
+        insert_mock_call_custom(&state, "c1", mock).await;
+        let addr = spawn_server(state).await;
+
+        let (mut ws, resp) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws/c1"))
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), 101u16);
+
+        // Should receive "connected" event
+        use futures_util::StreamExt;
+        let msg = ws.next().await.unwrap().unwrap();
+        let text = msg.into_text().unwrap();
+        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["event"], "connected");
+        assert_eq!(event["protocol"], "Call");
+
+        // Should receive "start" event
+        let msg = ws.next().await.unwrap().unwrap();
+        let text = msg.into_text().unwrap();
+        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["event"], "start");
+        assert_eq!(event["streamSid"], "c1");
+    }
 
     #[tokio::test]
     async fn ws_rejects_unknown_call() {
@@ -1115,7 +1142,74 @@ mod tests {
     }
 
     // ── Call control endpoints ──
-    // These need xphone::Call objects; test 404 behavior only.
+
+    /// Insert a MockCall into both registries, returning the Arc<MockCall> for assertions.
+    async fn insert_mock_call(state: &AppState, id: &str) -> Arc<crate::call_control::mock::MockCall> {
+        let mock = Arc::new(crate::call_control::mock::MockCall::default());
+        state.calls.write().await.insert(id.into(), sample_call(id));
+        state.xphone_calls.write().await.insert(id.into(), mock.clone());
+        mock
+    }
+
+    /// Insert a MockCall with custom config.
+    async fn insert_mock_call_custom(
+        state: &AppState,
+        id: &str,
+        mock: crate::call_control::mock::MockCall,
+    ) -> Arc<crate::call_control::mock::MockCall> {
+        let mock = Arc::new(mock);
+        state.calls.write().await.insert(id.into(), sample_call(id));
+        state.xphone_calls.write().await.insert(id.into(), mock.clone());
+        mock
+    }
+
+    // ── Hold ──
+
+    #[tokio::test]
+    async fn hold_success() {
+        let state = test_state();
+        insert_mock_call(&state, "c1").await;
+
+        let resp = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/hold")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.calls.read().await.get("c1").unwrap().status,
+            CallStatus::OnHold
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_error_returns_500() {
+        let state = test_state();
+        let mock = crate::call_control::mock::MockCall {
+            hold_ok: false,
+            ..Default::default()
+        };
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/hold")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[tokio::test]
     async fn hold_not_found() {
@@ -1133,6 +1227,56 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── Resume ──
+
+    #[tokio::test]
+    async fn resume_success() {
+        let state = test_state();
+        insert_mock_call(&state, "c1").await;
+        // Set status to OnHold first
+        state.calls.write().await.get_mut("c1").unwrap().status = CallStatus::OnHold;
+
+        let resp = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/resume")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.calls.read().await.get("c1").unwrap().status,
+            CallStatus::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_error_returns_500() {
+        let state = test_state();
+        let mock = crate::call_control::mock::MockCall {
+            resume_ok: false,
+            ..Default::default()
+        };
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/resume")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn resume_not_found() {
         let resp = app(test_state())
@@ -1147,6 +1291,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Transfer ──
+
+    #[tokio::test]
+    async fn transfer_success() {
+        let state = test_state();
+        let mock = insert_mock_call(&state, "c1").await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/transfer")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"target":"sip:1003@pbx"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let targets = mock.transfer_log.lock().unwrap();
+        assert_eq!(*targets, vec!["sip:1003@pbx"]);
+    }
+
+    #[tokio::test]
+    async fn transfer_error_returns_500() {
+        let state = test_state();
+        let mock = crate::call_control::mock::MockCall {
+            transfer_ok: false,
+            ..Default::default()
+        };
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/transfer")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"target":"sip:1003@pbx"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -1166,6 +1358,76 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── DTMF ──
+
+    #[tokio::test]
+    async fn dtmf_success() {
+        let state = test_state();
+        let mock = insert_mock_call(&state, "c1").await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/dtmf")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"digits":"1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let digits = mock.dtmf_log.lock().unwrap();
+        assert_eq!(*digits, vec!["1", "2", "3", "4"]);
+    }
+
+    #[tokio::test]
+    async fn dtmf_sends_star_and_hash() {
+        let state = test_state();
+        let mock = insert_mock_call(&state, "c1").await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/dtmf")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"digits":"*#0"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let digits = mock.dtmf_log.lock().unwrap();
+        assert_eq!(*digits, vec!["*", "#", "0"]);
+    }
+
+    #[tokio::test]
+    async fn dtmf_error_returns_500() {
+        let state = test_state();
+        let mock = crate::call_control::mock::MockCall {
+            dtmf_ok: false,
+            ..Default::default()
+        };
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/dtmf")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"digits":"1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn dtmf_not_found() {
         let resp = app(test_state())
@@ -1181,6 +1443,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Mute / Unmute ──
+
+    #[tokio::test]
+    async fn mute_success() {
+        let state = test_state();
+        insert_mock_call(&state, "c1").await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/mute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mute_error_returns_500() {
+        let state = test_state();
+        let mock = crate::call_control::mock::MockCall {
+            mute_ok: false,
+            ..Default::default()
+        };
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/mute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -1200,6 +1506,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmute_success() {
+        let state = test_state();
+        insert_mock_call(&state, "c1").await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/unmute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unmute_error_returns_500() {
+        let state = test_state();
+        let mock = crate::call_control::mock::MockCall {
+            unmute_ok: false,
+            ..Default::default()
+        };
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/unmute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn unmute_not_found() {
         let resp = app(test_state())
             .oneshot(
@@ -1215,7 +1563,185 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── Hangup with xphone call ──
+
+    #[tokio::test]
+    async fn hangup_ends_xphone_call() {
+        let state = test_state();
+        insert_mock_call(&state, "c1").await;
+
+        let resp = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/calls/c1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state.calls.read().await.get("c1").is_none());
+        assert!(state.xphone_calls.read().await.get("c1").is_none());
+    }
+
     // ── Play audio ──
+
+    #[tokio::test]
+    async fn play_base64_success() {
+        let state = test_state();
+        let (mock, _play_rx, _audio_tx) =
+            crate::call_control::mock::MockCall::with_pcm_channels();
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        // 4 bytes of raw PCM = 2 samples
+        let pcm_bytes = [0x00u8, 0x01, 0xFF, 0x7F];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_bytes);
+        let body = serde_json::json!({"audio": b64, "loop_count": 1});
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = body_json(resp).await;
+        assert!(body["play_id"].as_str().unwrap().starts_with("play_"));
+    }
+
+    #[tokio::test]
+    async fn play_no_audio_source_returns_400() {
+        let state = test_state();
+        let (mock, _play_rx, _audio_tx) =
+            crate::call_control::mock::MockCall::with_pcm_channels();
+        insert_mock_call_custom(&state, "c1", mock).await;
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"loop_count":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn play_no_pcm_writer_returns_500() {
+        let state = test_state();
+        // Default mock has no pcm channels
+        insert_mock_call(&state, "c1").await;
+
+        let pcm_bytes = [0x00u8, 0x01, 0xFF, 0x7F];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_bytes);
+        let body = serde_json::json!({"audio": b64, "loop_count": 1});
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn play_increments_play_id() {
+        let state = test_state();
+        let (mock1, _, _) = crate::call_control::mock::MockCall::with_pcm_channels();
+        insert_mock_call_custom(&state, "c1", mock1).await;
+
+        let pcm_bytes = [0x00u8; 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_bytes);
+        let body = serde_json::json!({"audio": &b64, "loop_count": 1});
+
+        let resp1 = app(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body1: serde_json::Value = body_json(resp1).await;
+        let id1 = body1["play_id"].as_str().unwrap().to_string();
+
+        // Need to re-insert since the app consumed it
+        let (mock2, _, _) = crate::call_control::mock::MockCall::with_pcm_channels();
+        insert_mock_call_custom(&state, "c1", mock2).await;
+
+        let resp2 = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"audio": &b64, "loop_count": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body2: serde_json::Value = body_json(resp2).await;
+        let id2 = body2["play_id"].as_str().unwrap().to_string();
+
+        assert_ne!(id1, id2);
+    }
+
+    // ── Stop play ──
+
+    #[tokio::test]
+    async fn stop_play_success() {
+        let state = test_state();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_check = cancel.clone();
+        let handle = crate::state::PlayHandle {
+            cancel,
+            task: tokio::spawn(futures_util::future::pending()),
+        };
+        state.plays.write().await.insert("c1".into(), handle);
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls/c1/play/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(cancel_check.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // ── Play audio (error paths) ──
 
     #[tokio::test]
     async fn play_not_found() {

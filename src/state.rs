@@ -4,12 +4,13 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::call::CallInfo;
+use crate::call_control::CallControl;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::webhook_client::WebhookClient;
 
 pub type CallRegistry = Arc<RwLock<HashMap<String, CallInfo>>>;
-pub type XphoneCallRegistry = Arc<RwLock<HashMap<String, Arc<xphone::Call>>>>;
+pub type XphoneCallRegistry = Arc<RwLock<HashMap<String, Arc<dyn CallControl>>>>;
 pub type PhoneRegistry = Arc<RwLock<HashMap<String, xphone::Phone>>>;
 
 /// Registry of active WebSocket senders, keyed by call_id.

@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 
 use crate::api::{IncomingCallAction, IncomingCallWebhook};
 use crate::call::{CallDirection, CallInfo, CallStatus};
+use crate::call_control::XphoneCall;
 use crate::config::{Config, SipConfig};
 use crate::state::AppState;
 use crate::webhook::WebhookEvent;
@@ -210,11 +211,10 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
             state.metrics.inc_calls_inbound();
 
             state.calls.write().await.insert(call_id.clone(), info);
-            state
-                .xphone_calls
-                .write()
-                .await
-                .insert(call_id.clone(), call.clone());
+            state.xphone_calls.write().await.insert(
+                call_id.clone(),
+                Arc::new(XphoneCall(call.clone())),
+            );
 
             // Send call.answered webhook
             state
