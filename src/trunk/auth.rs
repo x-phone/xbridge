@@ -165,6 +165,8 @@ mod tests {
     fn test_config() -> ServerConfig {
         ServerConfig {
             listen: "0.0.0.0:5080".into(),
+            rtp_port_min: 0,
+            rtp_port_max: 0,
             peers: vec![
                 PeerConfig {
                     name: "office-pbx".into(),
@@ -279,6 +281,8 @@ mod tests {
     fn no_peers_rejects() {
         let config = ServerConfig {
             listen: "0.0.0.0:5080".into(),
+            rtp_port_min: 0,
+            rtp_port_max: 0,
             peers: vec![],
         };
         let msg = make_invite(None);
@@ -290,6 +294,8 @@ mod tests {
     fn ip_only_peers_no_challenge() {
         let config = ServerConfig {
             listen: "0.0.0.0:5080".into(),
+            rtp_port_min: 0,
+            rtp_port_max: 0,
             peers: vec![PeerConfig {
                 name: "local".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
@@ -310,6 +316,8 @@ mod tests {
         // Peer has both IP and digest auth. IP match should win immediately.
         let config = ServerConfig {
             listen: "0.0.0.0:5080".into(),
+            rtp_port_min: 0,
+            rtp_port_max: 0,
             peers: vec![PeerConfig {
                 name: "both-auth".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),

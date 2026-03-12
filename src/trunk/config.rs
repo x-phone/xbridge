@@ -9,6 +9,12 @@ pub struct ServerConfig {
     /// Configured peers that are allowed to connect.
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// Minimum RTP port for media. 0 = OS-assigned.
+    #[serde(default)]
+    pub rtp_port_min: u16,
+    /// Maximum RTP port for media. 0 = OS-assigned.
+    #[serde(default)]
+    pub rtp_port_max: u16,
 }
 
 /// A known SIP peer (PBX system) that can send/receive calls.
@@ -153,6 +159,8 @@ listen: "0.0.0.0:5080"
     fn password_excluded_from_serialization() {
         let config = ServerConfig {
             listen: "0.0.0.0:5080".into(),
+            rtp_port_min: 0,
+            rtp_port_max: 0,
             peers: vec![PeerConfig {
                 name: "test".into(),
                 host: None,
