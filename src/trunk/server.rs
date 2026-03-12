@@ -44,8 +44,8 @@ pub async fn run(
 
     let dialogs: DialogMap = Arc::new(RwLock::new(HashMap::new()));
 
-    // Channel for TrunkDialog → socket outgoing messages.
-    let (sip_tx, mut sip_rx) = mpsc::unbounded_channel::<SipOutgoing>();
+    // Channel for TrunkDialog → socket outgoing messages (bounded to prevent OOM).
+    let (sip_tx, mut sip_rx) = mpsc::channel::<SipOutgoing>(4096);
 
     // Spawn send task: drains outgoing SIP messages and sends via the server socket.
     let send_socket = socket.clone();
@@ -121,7 +121,7 @@ async fn handle_invite(
     msg: SipMessage,
     state: &AppState,
     dialogs: &DialogMap,
-    sip_tx: &mpsc::UnboundedSender<SipOutgoing>,
+    sip_tx: &mpsc::Sender<SipOutgoing>,
 ) {
     let source_ip = addr.ip();
 
@@ -191,7 +191,7 @@ async fn handle_trunk_incoming(
     state: AppState,
     dialogs: DialogMap,
     sip_call_id: String,
-    sip_tx: mpsc::UnboundedSender<SipOutgoing>,
+    sip_tx: mpsc::Sender<SipOutgoing>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     rtp_port_min: u16,
@@ -257,13 +257,7 @@ async fn handle_trunk_incoming(
 
             let call = xphone::Call::new_inbound(dialog);
 
-            // Determine local IP for SDP (use the listen address, fall back to 0.0.0.0).
-            let local_ip = if local_addr.ip().is_unspecified() {
-                // Use first non-loopback IP, or fallback to listen addr.
-                local_addr.ip().to_string()
-            } else {
-                local_addr.ip().to_string()
-            };
+            let local_ip = local_addr.ip().to_string();
 
             call.set_local_media(&local_ip, rtp_port as i32);
             call.set_rtp_socket(rtp_socket);
@@ -335,7 +329,7 @@ async fn handle_trunk_incoming(
 
 /// Build and send a SIP error response via the outgoing channel (for pre-Call paths).
 fn send_reject_via_channel(
-    tx: &mpsc::UnboundedSender<SipOutgoing>,
+    tx: &mpsc::Sender<SipOutgoing>,
     invite: &SipMessage,
     remote_addr: SocketAddr,
     code: u16,
@@ -343,7 +337,7 @@ fn send_reject_via_channel(
 ) {
     let mut resp = SipMessage::new_response(code, reason);
     copy_dialog_headers(invite, &mut resp);
-    let _ = tx.send(SipOutgoing {
+    let _ = tx.try_send(SipOutgoing {
         data: resp.to_bytes(),
         addr: remote_addr,
     });
@@ -462,7 +456,7 @@ mod tests {
 
     #[test]
     fn send_reject_via_channel_builds_response() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let mut invite = SipMessage::new_request("INVITE", "sip:1002@xbridge:5080");
         invite.add_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK111");
         invite.set_header("From", "<sip:1001@pbx.local>;tag=from1");

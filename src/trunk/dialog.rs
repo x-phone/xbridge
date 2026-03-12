@@ -1,7 +1,7 @@
 //! `xphone::Dialog` implementation backed by xbridge's trunk SIP transport.
 //!
 //! Bridges xphone's synchronous Dialog trait to the trunk server's async UDP
-//! socket by queuing outgoing SIP messages through an unbounded channel.
+//! socket by queuing outgoing SIP messages through a bounded channel.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,8 +23,8 @@ pub(crate) struct SipOutgoing {
 /// When xphone's `Call` calls `respond()`, `send_bye()`, etc., this impl builds
 /// the SIP message and enqueues it for async delivery by the server's send task.
 pub(crate) struct TrunkDialog {
-    /// Channel for outgoing SIP datagrams.
-    tx: mpsc::UnboundedSender<SipOutgoing>,
+    /// Channel for outgoing SIP datagrams (bounded to prevent OOM).
+    tx: mpsc::Sender<SipOutgoing>,
     /// Remote peer address.
     remote_addr: SocketAddr,
     /// Local server listen address (for Via headers in outgoing requests).
@@ -51,14 +51,14 @@ pub(crate) struct TrunkDialog {
 impl TrunkDialog {
     /// Create a new TrunkDialog from an incoming INVITE.
     pub(crate) fn new(
-        tx: mpsc::UnboundedSender<SipOutgoing>,
+        tx: mpsc::Sender<SipOutgoing>,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
         invite: &SipMessage,
         local_tag: String,
     ) -> Self {
-        // Build headers map from the INVITE.
-        let mut headers = HashMap::new();
+        // Build headers map from the INVITE (lowercase keys for case-insensitive lookup).
+        let mut headers = HashMap::with_capacity(6);
         for name in &["From", "To", "Call-ID", "Via", "Contact", "CSeq"] {
             let vals: Vec<String> = invite
                 .header_values(name)
@@ -66,7 +66,7 @@ impl TrunkDialog {
                 .map(|v| v.to_string())
                 .collect();
             if !vals.is_empty() {
-                headers.insert(name.to_string(), vals);
+                headers.insert(name.to_lowercase(), vals);
             }
         }
 
@@ -150,11 +150,11 @@ impl TrunkDialog {
     fn enqueue(&self, msg: SipMessage) -> xphone::Result<()> {
         let data = msg.to_bytes();
         self.tx
-            .send(SipOutgoing {
+            .try_send(SipOutgoing {
                 data,
                 addr: self.remote_addr,
             })
-            .map_err(|_| xphone::Error::Other("trunk send channel closed".into()))
+            .map_err(|_| xphone::Error::Other("trunk send channel full or closed".into()))
     }
 
     fn to_with_tag(&self) -> String {
@@ -223,13 +223,11 @@ impl xphone::dialog::Dialog for TrunkDialog {
     }
 
     fn header(&self, name: &str) -> Vec<String> {
-        let name_lower = name.to_lowercase();
-        for (k, v) in &self.invite_headers {
-            if k.to_lowercase() == name_lower {
-                return v.clone();
-            }
-        }
-        Vec::new()
+        // Keys are stored in lowercase; only lowercase the lookup key.
+        self.invite_headers
+            .get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn headers(&self) -> HashMap<String, Vec<String>> {
@@ -264,8 +262,8 @@ mod tests {
         msg
     }
 
-    fn make_dialog() -> (TrunkDialog, mpsc::UnboundedReceiver<SipOutgoing>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn make_dialog() -> (TrunkDialog, mpsc::Receiver<SipOutgoing>) {
+        let (tx, rx) = mpsc::channel(64);
         let invite = sample_invite();
         let dialog = TrunkDialog::new(
             tx,
@@ -431,9 +429,9 @@ mod tests {
     fn headers_returns_all() {
         let (dialog, _rx) = make_dialog();
         let all = dialog.headers();
-        assert!(all.contains_key("From"));
-        assert!(all.contains_key("To"));
-        assert!(all.contains_key("Call-ID"));
+        assert!(all.contains_key("from"));
+        assert!(all.contains_key("to"));
+        assert!(all.contains_key("call-id"));
     }
 
     #[test]
