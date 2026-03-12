@@ -190,6 +190,7 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
         from: from.clone(),
         to: to.clone(),
         direction: CallDirection::Inbound,
+        peer: None,
     };
 
     let response = match state.webhook.send_incoming(&hook).await {
@@ -214,6 +215,7 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
                 to,
                 direction: CallDirection::Inbound,
                 status: CallStatus::InProgress,
+                peer: None,
             };
 
             state.metrics.inc_calls_total();

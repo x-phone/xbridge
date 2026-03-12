@@ -16,6 +16,8 @@ struct MetricsInner {
     pub webhooks_failed: AtomicU64,
     pub http_requests: AtomicU64,
     pub ws_connections: AtomicU64,
+    pub trunk_calls_inbound: AtomicU64,
+    pub trunk_auth_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -55,6 +57,14 @@ impl Metrics {
         self.inner.ws_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub fn inc_trunk_calls_inbound(&self) {
+        self.inner.trunk_calls_inbound.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_trunk_auth_failures(&self) {
+        self.inner.trunk_auth_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Render metrics in Prometheus text exposition format.
     pub fn render(&self, active_calls: usize) -> String {
         let i = &self.inner;
@@ -77,6 +87,12 @@ xbridge_ws_connections {ws}
 # TYPE xbridge_webhooks_total counter
 xbridge_webhooks_total {{result=\"success\"}} {wh_ok}
 xbridge_webhooks_total {{result=\"failure\"}} {wh_fail}
+# HELP xbridge_trunk_calls_total Total calls from trunk host peers
+# TYPE xbridge_trunk_calls_total counter
+xbridge_trunk_calls_total {trunk_in}
+# HELP xbridge_trunk_auth_failures_total Rejected/failed trunk auth attempts
+# TYPE xbridge_trunk_auth_failures_total counter
+xbridge_trunk_auth_failures_total {trunk_auth_fail}
 ",
             inbound = i.calls_inbound.load(Ordering::Relaxed),
             outbound = i.calls_outbound.load(Ordering::Relaxed),
@@ -85,6 +101,8 @@ xbridge_webhooks_total {{result=\"failure\"}} {wh_fail}
             ws = i.ws_connections.load(Ordering::Relaxed),
             wh_ok = i.webhooks_sent.load(Ordering::Relaxed),
             wh_fail = i.webhooks_failed.load(Ordering::Relaxed),
+            trunk_in = i.trunk_calls_inbound.load(Ordering::Relaxed),
+            trunk_auth_fail = i.trunk_auth_failures.load(Ordering::Relaxed),
         )
     }
 }

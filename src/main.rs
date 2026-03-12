@@ -27,7 +27,7 @@ async fn main() {
 
     let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx, state_tx);
 
-    // Start SIP bridge in background
+    // Start SIP bridge in background (trunk client — registers with providers)
     let bridge_state = state.clone();
     let bridge_config = config.clone();
     tokio::spawn(async move {
@@ -37,6 +37,19 @@ async fn main() {
             tracing::error!("SIP bridge error: {e}");
         }
     });
+
+    // Start trunk host server if configured
+    if let Some(ref server_config) = config.server {
+        let server_config = server_config.clone();
+        let trunk_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                xbridge::trunk::server::run(server_config, trunk_state).await
+            {
+                tracing::error!("trunk host server error: {e}");
+            }
+        });
+    }
 
     tracing::info!("xbridge listening on {addr}");
     serve(&config, app(state), &addr).await;

@@ -2104,6 +2104,7 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "http-body-util",
+ "md5",
  "rand",
  "reqwest",
  "serde",

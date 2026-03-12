@@ -24,6 +24,9 @@ pub struct CallInfo {
     pub to: String,
     pub direction: CallDirection,
     pub status: CallStatus,
+    /// Name of the trunk host peer, if this call came from/to a peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
 }
 
 #[cfg(test)]
@@ -75,6 +78,7 @@ mod tests {
             to: "+15559876543".into(),
             direction: CallDirection::Inbound,
             status: CallStatus::InProgress,
+            peer: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["call_id"], "abc123");

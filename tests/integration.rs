@@ -27,6 +27,7 @@ fn test_config() -> Config {
         auth: AuthConfig::default(),
         tls: TlsConfig::default(),
         rate_limit: RateLimitConfig::default(),
+        server: None,
     }
 }
 
@@ -75,6 +76,7 @@ async fn health_shows_active_calls() {
             to: "+2".into(),
             direction: CallDirection::Inbound,
             status: CallStatus::InProgress,
+            peer: None,
         },
     );
     let base = spawn_server(state).await;
@@ -138,6 +140,7 @@ async fn list_calls_returns_inserted_call() {
             to: "+15559876543".into(),
             direction: CallDirection::Outbound,
             status: CallStatus::Dialing,
+            peer: None,
         },
     );
     let base = spawn_server(state).await;
@@ -166,6 +169,7 @@ async fn get_call_found() {
             to: "+2".into(),
             direction: CallDirection::Inbound,
             status: CallStatus::InProgress,
+            peer: None,
         },
     );
     let base = spawn_server(state).await;
@@ -200,6 +204,7 @@ async fn hangup_removes_call() {
             to: "+2".into(),
             direction: CallDirection::Inbound,
             status: CallStatus::InProgress,
+            peer: None,
         },
     );
     let base = spawn_server(state).await;

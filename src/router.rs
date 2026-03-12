@@ -257,6 +257,7 @@ async fn create_call(
         to: req.to.clone(),
         direction: CallDirection::Outbound,
         status: CallStatus::Dialing,
+        peer: None,
     };
 
     // Insert into both registries (brief TOCTOU window between the two awaits)
@@ -814,6 +815,7 @@ mod tests {
             auth: AuthConfig::default(),
             tls: crate::config::TlsConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            server: None,
         }
     }
 
@@ -833,6 +835,7 @@ mod tests {
             to: "+15559876543".into(),
             direction: CallDirection::Inbound,
             status: CallStatus::InProgress,
+            peer: None,
         }
     }
 

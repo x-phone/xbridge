@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 
+use crate::trunk::config::ServerConfig;
+
 // ── Error ──
 
 #[derive(Debug)]
@@ -57,6 +59,9 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Optional SIP trunk host server configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -217,6 +222,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             tls: TlsConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            server: None,
         }
     }
 }
