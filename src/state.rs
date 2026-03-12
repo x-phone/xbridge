@@ -20,6 +20,17 @@ pub type WsSenderRegistry = Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<M
 /// Registry of active playback handles, keyed by call_id.
 pub type PlayRegistry = Arc<RwLock<HashMap<String, PlayHandle>>>;
 
+/// Entry in the trunk dialog map (SIP Call-ID → active dialog state).
+pub(crate) struct TrunkDialogEntry {
+    /// xbridge call_id for reverse lookup during cleanup.
+    pub xbridge_call_id: Option<String>,
+    /// xphone::Call reference (for simulate_bye on remote hangup).
+    pub xphone_call: Option<Arc<xphone::Call>>,
+}
+
+/// Registry of active trunk SIP dialogs, keyed by SIP Call-ID.
+pub(crate) type TrunkDialogMap = Arc<RwLock<HashMap<String, TrunkDialogEntry>>>;
+
 pub struct PlayHandle {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     pub task: tokio::task::JoinHandle<()>,
@@ -39,6 +50,7 @@ pub struct AppState {
     pub(crate) ws_senders: WsSenderRegistry,
     pub(crate) plays: PlayRegistry,
     pub(crate) play_counter: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) trunk_dialogs: TrunkDialogMap,
 }
 
 impl AppState {
@@ -62,6 +74,7 @@ impl AppState {
             ws_senders: Arc::new(std::sync::RwLock::new(HashMap::new())),
             plays: Arc::new(RwLock::new(HashMap::new())),
             play_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            trunk_dialogs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

@@ -88,6 +88,11 @@ pub async fn run(
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 handle.task.abort();
             }
+            // Remove trunk dialog entry (for trunk host calls ending via local hangup).
+            if call_id.starts_with("trunk-") {
+                let mut dialogs = ended_state.trunk_dialogs.write().await;
+                dialogs.retain(|_, entry| entry.xbridge_call_id.as_deref() != Some(&call_id));
+            }
 
             let reason_str = end_reason_str(reason);
 

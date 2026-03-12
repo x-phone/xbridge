@@ -4,31 +4,20 @@
 //! xphone handles codec negotiation, SDP answer generation, and the full RTP media
 //! pipeline. The trunk server only handles SIP signalling transport.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::bridge;
 use crate::call_control::XphoneCall;
-use crate::state::AppState;
+use crate::state::{AppState, TrunkDialogEntry, TrunkDialogMap};
 use crate::trunk::auth::{self, AuthResult};
 use crate::trunk::config::ServerConfig;
 use crate::trunk::dialog::{SipOutgoing, TrunkDialog};
 use crate::trunk::sip_msg::{self, SipMessage};
 use crate::trunk::util::{ensure_to_tag, generate_tag, reject_reason_to_sip_code, uuid_v4};
-
-/// Active dialog state for in-progress calls.
-struct ActiveDialog {
-    /// Maps SIP Call-ID → xbridge call_id for cleanup.
-    xbridge_call_id: Option<String>,
-    /// Reference to the xphone::Call (for simulate_bye on remote hangup).
-    xphone_call: Option<Arc<xphone::Call>>,
-}
-
-type DialogMap = Arc<RwLock<HashMap<String, ActiveDialog>>>;
 
 /// Run the SIP trunk host server.
 ///
@@ -42,7 +31,7 @@ pub async fn run(
     let local_addr = socket.local_addr()?;
     info!("trunk host listening on {}", config.listen);
 
-    let dialogs: DialogMap = Arc::new(RwLock::new(HashMap::new()));
+    let dialogs = state.trunk_dialogs.clone();
 
     // Channel for TrunkDialog → socket outgoing messages (bounded to prevent OOM).
     let (sip_tx, mut sip_rx) = mpsc::channel::<SipOutgoing>(4096);
@@ -120,7 +109,7 @@ async fn handle_invite(
     addr: SocketAddr,
     msg: SipMessage,
     state: &AppState,
-    dialogs: &DialogMap,
+    dialogs: &TrunkDialogMap,
     sip_tx: &mpsc::Sender<SipOutgoing>,
 ) {
     let source_ip = addr.ip();
@@ -136,7 +125,7 @@ async fn handle_invite(
             let sip_call_id = msg.call_id().to_string();
             dialogs.write().await.insert(
                 sip_call_id.clone(),
-                ActiveDialog {
+                TrunkDialogEntry {
                     xbridge_call_id: None,
                     xphone_call: None,
                 },
@@ -189,7 +178,7 @@ async fn handle_trunk_incoming(
     invite: &SipMessage,
     peer_name: String,
     state: AppState,
-    dialogs: DialogMap,
+    dialogs: TrunkDialogMap,
     sip_call_id: String,
     sip_tx: mpsc::Sender<SipOutgoing>,
     local_addr: SocketAddr,
@@ -348,7 +337,7 @@ async fn handle_bye(
     addr: SocketAddr,
     msg: &SipMessage,
     _state: &AppState,
-    dialogs: &DialogMap,
+    dialogs: &TrunkDialogMap,
 ) {
     let sip_call_id = msg.call_id().to_string();
     debug!("BYE from {addr} for Call-ID={sip_call_id}");
@@ -368,7 +357,7 @@ async fn handle_cancel(
     socket: &UdpSocket,
     addr: SocketAddr,
     msg: &SipMessage,
-    dialogs: &DialogMap,
+    dialogs: &TrunkDialogMap,
 ) {
     let sip_call_id = msg.call_id().to_string();
     debug!("CANCEL from {addr} for Call-ID={sip_call_id}");
