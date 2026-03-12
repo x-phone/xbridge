@@ -1,5 +1,6 @@
-//! SIP trunk host server — listens for incoming SIP traffic from PBX peers.
+//! SIP trunk host server — listens for SIP traffic from PBX peers.
 //!
+//! Handles both inbound (peer → xbridge) and outbound (xbridge → peer) calls.
 //! Authenticated INVITEs are wired through xphone::Call (via TrunkDialog) so that
 //! xphone handles codec negotiation, SDP answer generation, and the full RTP media
 //! pipeline. The trunk server only handles SIP signalling transport.
@@ -17,7 +18,7 @@ use crate::trunk::auth::{self, AuthResult};
 use crate::trunk::config::ServerConfig;
 use crate::trunk::dialog::{SipOutgoing, TrunkDialog};
 use crate::trunk::sip_msg::{self, SipMessage};
-use crate::trunk::util::{ensure_to_tag, generate_tag, reject_reason_to_sip_code, uuid_v4};
+use crate::trunk::util::{ensure_to_tag, generate_branch, generate_tag, reject_reason_to_sip_code, uuid_v4};
 
 /// Run the SIP trunk host server.
 ///
@@ -35,6 +36,10 @@ pub async fn run(
 
     // Channel for TrunkDialog → socket outgoing messages (bounded to prevent OOM).
     let (sip_tx, mut sip_rx) = mpsc::channel::<SipOutgoing>(4096);
+
+    // Store sip_tx and local_addr in state so the router can use them for outbound calls.
+    *state.trunk_sip_tx.write().await = Some(sip_tx.clone());
+    *state.trunk_local_addr.write().await = Some(local_addr);
 
     // Spawn send task: drains outgoing SIP messages and sends via the server socket.
     let send_socket = socket.clone();
@@ -61,7 +66,7 @@ pub async fn run(
         };
 
         if msg.is_response() {
-            debug!("ignoring SIP response from {addr}");
+            handle_response(&msg, &dialogs, &sip_tx, local_addr).await;
             continue;
         }
 
@@ -128,6 +133,7 @@ async fn handle_invite(
                 TrunkDialogEntry {
                     xbridge_call_id: None,
                     xphone_call: None,
+                    trunk_dialog: None,
                 },
             );
 
@@ -290,9 +296,9 @@ async fn handle_trunk_incoming(
             }
 
             // Track xphone call in dialog for BYE cleanup.
-            if let Some(dialog) = dialogs.write().await.get_mut(&sip_call_id) {
-                dialog.xbridge_call_id = Some(call_id.clone());
-                dialog.xphone_call = Some(call.clone());
+            if let Some(entry) = dialogs.write().await.get_mut(&sip_call_id) {
+                entry.xbridge_call_id = Some(call_id.clone());
+                entry.xphone_call = Some(call.clone());
             }
 
             // Wire on_ended / on_dtmf callbacks (shared with trunk-provider path).
@@ -326,10 +332,12 @@ fn send_reject_via_channel(
 ) {
     let mut resp = SipMessage::new_response(code, reason);
     copy_dialog_headers(invite, &mut resp);
-    let _ = tx.try_send(SipOutgoing {
+    if let Err(e) = tx.try_send(SipOutgoing {
         data: resp.to_bytes(),
         addr: remote_addr,
-    });
+    }) {
+        warn!("failed to send SIP {code} reject to {remote_addr}: {e}");
+    }
 }
 
 async fn handle_bye(
@@ -378,6 +386,172 @@ async fn handle_cancel(
         resp.set_header("CSeq", &format!("{seq} INVITE"));
         let data = resp.to_bytes();
         let _ = socket.send_to(&data, addr).await;
+    }
+}
+
+/// Handle a SIP response (for outbound calls to peers).
+/// Routes 1xx/2xx/error responses to the corresponding xphone::Call.
+async fn handle_response(
+    msg: &SipMessage,
+    dialogs: &TrunkDialogMap,
+    sip_tx: &mpsc::Sender<SipOutgoing>,
+    local_addr: SocketAddr,
+) {
+    let sip_call_id = msg.call_id().to_string();
+    let code = msg.status_code;
+    let (_, cseq_method) = msg.cseq();
+
+    debug!("SIP response {code} for Call-ID={sip_call_id} (CSeq method={cseq_method})");
+
+    // Only handle responses to INVITE (ignore BYE/CANCEL responses).
+    if cseq_method != "INVITE" {
+        return;
+    }
+
+    let dialogs_read = dialogs.read().await;
+    let dialog_entry = match dialogs_read.get(&sip_call_id) {
+        Some(entry) => entry,
+        None => {
+            debug!("no dialog for response Call-ID={sip_call_id}");
+            return;
+        }
+    };
+
+    let call = match dialog_entry.xphone_call.as_ref() {
+        Some(c) => c.clone(),
+        None => return,
+    };
+    let trunk_dialog = dialog_entry.trunk_dialog.clone();
+    drop(dialogs_read);
+
+    match code {
+        100 => {
+            debug!("100 Trying for outbound Call-ID={sip_call_id}");
+        }
+        180 | 183 => {
+            if let Some(ref dlg) = trunk_dialog {
+                dlg.update_from_response(msg);
+            }
+            call.simulate_response(code, &msg.reason);
+        }
+        200..=299 => {
+            if let Some(ref dlg) = trunk_dialog {
+                dlg.update_from_response(msg);
+            }
+            if !msg.body.is_empty() {
+                if let Ok(sdp_str) = std::str::from_utf8(&msg.body) {
+                    call.set_remote_sdp(sdp_str);
+                }
+            }
+            call.simulate_response(200, "OK");
+
+            // Send ACK.
+            send_ack(sip_tx, msg, &sip_call_id, local_addr);
+        }
+        _ => {
+            // 3xx/4xx/5xx/6xx: call failed.
+            warn!("outbound call {sip_call_id} rejected with {code}");
+            call.simulate_bye();
+            dialogs.write().await.remove(&sip_call_id);
+        }
+    }
+}
+
+/// Send ACK for a 200 OK response to our outbound INVITE.
+fn send_ack(
+    tx: &mpsc::Sender<SipOutgoing>,
+    ok_response: &SipMessage,
+    sip_call_id: &str,
+    local_addr: SocketAddr,
+) {
+    // ACK Request-URI comes from the Contact header of the 200 OK,
+    // or fall back to the To header URI.
+    let contact = ok_response.header("Contact");
+    let request_uri = if !contact.is_empty() {
+        crate::trunk::dialog::extract_uri(contact).to_string()
+    } else {
+        let to = ok_response.header("To");
+        crate::trunk::dialog::extract_uri(to).to_string()
+    };
+
+    // ACK destination: parse host:port from Contact URI or Request-URI.
+    let dest_addr = parse_addr_from_uri(&request_uri)
+        .unwrap_or_else(|| "0.0.0.0:5060".parse().unwrap());
+
+    let branch = generate_branch();
+    let mut ack = SipMessage::new_request("ACK", &request_uri);
+    ack.set_header(
+        "Via",
+        &format!("SIP/2.0/UDP {local_addr};branch={branch}"),
+    );
+    ack.set_header("From", ok_response.header("From"));
+    ack.set_header("To", ok_response.header("To"));
+    ack.set_header("Call-ID", sip_call_id);
+    // ACK CSeq must match the INVITE's CSeq number.
+    let (cseq_num, _) = ok_response.cseq();
+    ack.set_header("CSeq", &format!("{cseq_num} ACK"));
+
+    if let Err(e) = tx.try_send(SipOutgoing {
+        data: ack.to_bytes(),
+        addr: dest_addr,
+    }) {
+        warn!("failed to send ACK for Call-ID={sip_call_id}: {e}");
+    }
+}
+
+/// Parse a SocketAddr from a SIP URI (e.g., "sip:1001@10.0.0.1:5060" → 10.0.0.1:5060).
+fn parse_addr_from_uri(uri: &str) -> Option<SocketAddr> {
+    let host_part = uri.split('@').nth(1)?;
+    // Try parsing as SocketAddr directly.
+    if let Ok(addr) = host_part.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    // Try parsing as IP (default port 5060).
+    if let Ok(ip) = host_part.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, 5060));
+    }
+    None
+}
+
+/// Build an outbound INVITE to a peer and send it via the SIP channel.
+pub(crate) fn build_and_send_invite(
+    sip_tx: &mpsc::Sender<SipOutgoing>,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    sip_call_id: &str,
+    local_tag: &str,
+    from: &str,
+    to: &str,
+    sdp: &str,
+) {
+    let branch = generate_branch();
+    let request_uri = format!("sip:{}@{}", to, remote_addr);
+
+    let mut invite = SipMessage::new_request("INVITE", &request_uri);
+    invite.set_header(
+        "Via",
+        &format!("SIP/2.0/UDP {local_addr};branch={branch}"),
+    );
+    invite.set_header(
+        "From",
+        &format!("<sip:{from}@{local_addr}>;tag={local_tag}"),
+    );
+    invite.set_header("To", &format!("<sip:{to}@{remote_addr}>"));
+    invite.set_header("Call-ID", sip_call_id);
+    invite.set_header("CSeq", "1 INVITE");
+    invite.set_header(
+        "Contact",
+        &format!("<sip:xbridge@{local_addr}>"),
+    );
+    invite.set_header("Max-Forwards", "70");
+    invite.set_header("Content-Type", "application/sdp");
+    invite.body = sdp.as_bytes().to_vec();
+
+    if let Err(e) = sip_tx.try_send(SipOutgoing {
+        data: invite.to_bytes(),
+        addr: remote_addr,
+    }) {
+        warn!("failed to send INVITE to {remote_addr}: {e}");
     }
 }
 
@@ -466,6 +640,48 @@ mod tests {
         assert!(msg.is_response());
         assert_eq!(msg.status_code, 486);
         assert_eq!(msg.header("Call-ID"), "test@host");
+        assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_addr_from_sip_uri() {
+        assert_eq!(
+            parse_addr_from_uri("sip:1001@10.0.0.1:5060"),
+            Some("10.0.0.1:5060".parse().unwrap())
+        );
+        assert_eq!(
+            parse_addr_from_uri("sip:1001@192.168.1.1"),
+            Some("192.168.1.1:5060".parse().unwrap())
+        );
+        assert!(parse_addr_from_uri("sip:1001").is_none());
+    }
+
+    #[test]
+    fn build_outbound_invite_message() {
+        let (tx, mut rx) = mpsc::channel(64);
+        build_and_send_invite(
+            &tx,
+            "127.0.0.1:5080".parse().unwrap(),
+            "10.0.0.1:5060".parse().unwrap(),
+            "test-call-id@xbridge",
+            "localtag1",
+            "1001",
+            "1002",
+            "v=0\r\n",
+        );
+
+        let outgoing = rx.try_recv().unwrap();
+        let msg = sip_msg::parse(&outgoing.data).unwrap();
+        assert!(!msg.is_response());
+        assert_eq!(msg.method, "INVITE");
+        assert_eq!(msg.request_uri, "sip:1002@10.0.0.1:5060");
+        assert_eq!(msg.header("Call-ID"), "test-call-id@xbridge");
+        assert!(msg.header("From").contains("1001@127.0.0.1:5080"));
+        assert!(msg.header("From").contains("tag=localtag1"));
+        assert!(msg.header("To").contains("1002@10.0.0.1:5060"));
+        assert_eq!(msg.header("CSeq"), "1 INVITE");
+        assert_eq!(msg.header("Content-Type"), "application/sdp");
+        assert_eq!(String::from_utf8_lossy(&msg.body), "v=0\r\n");
         assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
     }
 }

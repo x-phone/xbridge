@@ -1,5 +1,6 @@
 use axum::extract::ws::Message;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -7,6 +8,7 @@ use crate::call::CallInfo;
 use crate::call_control::CallControl;
 use crate::config::Config;
 use crate::metrics::Metrics;
+use crate::trunk::dialog::{SipOutgoing, TrunkDialog};
 use crate::webhook_client::WebhookClient;
 
 pub type CallRegistry = Arc<RwLock<HashMap<String, CallInfo>>>;
@@ -26,6 +28,8 @@ pub(crate) struct TrunkDialogEntry {
     pub xbridge_call_id: Option<String>,
     /// xphone::Call reference (for simulate_bye on remote hangup).
     pub xphone_call: Option<Arc<xphone::Call>>,
+    /// TrunkDialog reference (for updating dialog state from SIP responses).
+    pub trunk_dialog: Option<Arc<TrunkDialog>>,
 }
 
 /// Registry of active trunk SIP dialogs, keyed by SIP Call-ID.
@@ -51,6 +55,10 @@ pub struct AppState {
     pub(crate) plays: PlayRegistry,
     pub(crate) play_counter: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) trunk_dialogs: TrunkDialogMap,
+    /// Trunk server SIP send channel (set when trunk host server starts).
+    pub(crate) trunk_sip_tx: Arc<RwLock<Option<mpsc::Sender<SipOutgoing>>>>,
+    /// Trunk server local address (set when trunk host server starts).
+    pub(crate) trunk_local_addr: Arc<RwLock<Option<SocketAddr>>>,
 }
 
 impl AppState {
@@ -75,6 +83,8 @@ impl AppState {
             plays: Arc::new(RwLock::new(HashMap::new())),
             play_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             trunk_dialogs: Arc::new(RwLock::new(HashMap::new())),
+            trunk_sip_tx: Arc::new(RwLock::new(None)),
+            trunk_local_addr: Arc::new(RwLock::new(None)),
         }
     }
 }

@@ -171,12 +171,14 @@ mod tests {
                 PeerConfig {
                     name: "office-pbx".into(),
                     host: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+                    port: 5060,
                     auth: None,
                     codecs: vec![],
                 },
                 PeerConfig {
                     name: "remote-office".into(),
                     host: None,
+                    port: 5060,
                     auth: Some(crate::trunk::config::PeerAuthConfig {
                         username: "remote-trunk".into(),
                         password: "secret123".into(),
@@ -299,6 +301,7 @@ mod tests {
             peers: vec![PeerConfig {
                 name: "local".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                port: 5060,
                 auth: None,
                 codecs: vec![],
             }],
@@ -321,6 +324,7 @@ mod tests {
             peers: vec![PeerConfig {
                 name: "both-auth".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                port: 5060,
                 auth: Some(crate::trunk::config::PeerAuthConfig {
                     username: "user".into(),
                     password: "pass".into(),

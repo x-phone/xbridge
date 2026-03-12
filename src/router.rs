@@ -215,6 +215,11 @@ async fn create_call(
     headers: HeaderMap,
     Json(req): Json<CreateCallRequest>,
 ) -> Result<Json<CreateCallResponse>, StatusCode> {
+    // Route to peer or trunk provider based on request.
+    if let Some(ref peer_name) = req.peer {
+        return create_call_to_peer(&state, &headers, &req, peer_name).await;
+    }
+
     let trunk_name = req.trunk.as_deref().unwrap_or("default");
 
     let phones = state.phones.read().await;
@@ -278,6 +283,163 @@ async fn create_call(
     bridge::wire_outbound_state_callbacks(&call, &call_id, &state);
 
     // Build ws_url from Host header or config
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(state.config.listen.http.as_str());
+    let ws_url = format!("ws://{host}/ws/{call_id}");
+
+    Ok(Json(CreateCallResponse {
+        call_id,
+        status: CallStatus::Dialing,
+        ws_url,
+    }))
+}
+
+/// Create an outbound call to a configured peer via the trunk host server.
+async fn create_call_to_peer(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: &CreateCallRequest,
+    peer_name: &str,
+) -> Result<Json<CreateCallResponse>, StatusCode> {
+    // Look up peer config.
+    let server_config = state.config.server.as_ref().ok_or_else(|| {
+        tracing::error!("peer '{peer_name}' requested but no trunk server configured");
+        StatusCode::NOT_FOUND
+    })?;
+    let peer = server_config
+        .peers
+        .iter()
+        .find(|p| p.name == peer_name)
+        .ok_or_else(|| {
+            tracing::error!("peer '{peer_name}' not found in server config");
+            StatusCode::NOT_FOUND
+        })?;
+    let peer_ip = peer.host.ok_or_else(|| {
+        tracing::error!("peer '{peer_name}' has no host IP for outbound calls");
+        StatusCode::UNPROCESSABLE_ENTITY
+    })?;
+
+    // Get trunk server infrastructure.
+    let sip_tx = state.trunk_sip_tx.read().await.clone().ok_or_else(|| {
+        tracing::error!("trunk server not running, cannot dial peer");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    let local_addr = state.trunk_local_addr.read().await.ok_or_else(|| {
+        tracing::error!("trunk server local address not available");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let rtp_port_min = server_config.rtp_port_min;
+    let rtp_port_max = server_config.rtp_port_max;
+
+    // Allocate RTP port.
+    let (rtp_socket, rtp_port) =
+        xphone::media::listen_rtp_port(rtp_port_min, rtp_port_max).map_err(|e| {
+            tracing::error!("RTP port allocation failed for peer call: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Build SDP offer.
+    let local_ip = local_addr.ip().to_string();
+    let sdp_offer = xphone::sdp::build_offer(
+        &local_ip,
+        rtp_port as i32,
+        &[0, 8, 101], // PCMU, PCMA, telephone-event
+        xphone::sdp::DIR_SEND_RECV,
+    );
+
+    // Create dialog and call.
+    let sip_call_id = crate::trunk::util::uuid_v4();
+    let local_tag = crate::trunk::util::generate_tag();
+    let remote_addr = std::net::SocketAddr::new(peer_ip, peer.port);
+
+    let from_header = format!(
+        "<sip:{}@{}>",
+        req.from, local_addr
+    );
+    let to_header = format!(
+        "<sip:{}@{}>",
+        req.to, remote_addr
+    );
+
+    let dialog = Arc::new(crate::trunk::dialog::TrunkDialog::new_outbound(
+        sip_tx.clone(),
+        local_addr,
+        remote_addr,
+        sip_call_id.clone(),
+        local_tag.clone(),
+        from_header.clone(),
+        to_header.clone(),
+    ));
+
+    let opts = xphone::DialOptions {
+        caller_id: Some(req.from.clone()),
+        ..Default::default()
+    };
+
+    let call = xphone::Call::new_outbound(dialog.clone() as Arc<dyn xphone::dialog::Dialog>, opts);
+    call.set_local_media(&local_ip, rtp_port as i32);
+    call.set_rtp_socket(rtp_socket);
+
+    let call_id = format!("trunk-{}", crate::trunk::util::uuid_v4());
+
+    // Register in state.
+    let info = CallInfo {
+        call_id: call_id.clone(),
+        from: req.from.clone(),
+        to: req.to.clone(),
+        direction: CallDirection::Outbound,
+        status: CallStatus::Dialing,
+        peer: Some(peer_name.to_string()),
+    };
+
+    state.metrics.inc_calls_total();
+    state.metrics.inc_calls_outbound();
+
+    {
+        state.calls.write().await.insert(call_id.clone(), info);
+        state
+            .xphone_calls
+            .write()
+            .await
+            .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
+    }
+
+    // Track in trunk_dialogs for response routing and cleanup.
+    state.trunk_dialogs.write().await.insert(
+        sip_call_id.clone(),
+        crate::state::TrunkDialogEntry {
+            xbridge_call_id: Some(call_id.clone()),
+            xphone_call: Some(call.clone()),
+            trunk_dialog: Some(dialog),
+        },
+    );
+
+    // Wire callbacks.
+    bridge::wire_call_callbacks(&call, &call_id, state);
+    bridge::wire_outbound_state_callbacks(&call, &call_id, state);
+
+    // Send INVITE to peer.
+    crate::trunk::server::build_and_send_invite(
+        &sip_tx,
+        local_addr,
+        remote_addr,
+        &sip_call_id,
+        &local_tag,
+        &req.from,
+        &req.to,
+        &sdp_offer,
+    );
+
+    tracing::info!(
+        "outbound call {call_id} to peer '{peer_name}' at {remote_addr}: {} → {}",
+        req.from,
+        req.to
+    );
+
+    // Build ws_url.
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())

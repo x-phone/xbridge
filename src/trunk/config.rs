@@ -25,12 +25,19 @@ pub struct PeerConfig {
     /// IP address for IP-based authentication. If set, INVITEs from this IP are accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<IpAddr>,
+    /// SIP port for outbound calls to this peer. Defaults to 5060.
+    #[serde(default = "default_sip_port")]
+    pub port: u16,
     /// Digest authentication credentials. If set, INVITEs are challenged with 401.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<PeerAuthConfig>,
     /// Allowed codecs (e.g., ["ulaw", "alaw"]). Empty means accept any.
     #[serde(default)]
     pub codecs: Vec<String>,
+}
+
+fn default_sip_port() -> u16 {
+    5060
 }
 
 /// Digest auth credentials for a peer.
@@ -124,6 +131,7 @@ listen: "0.0.0.0:5080"
         let peer = PeerConfig {
             name: "test".into(),
             host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            port: 5060,
             auth: None,
             codecs: vec![],
         };
@@ -135,6 +143,7 @@ listen: "0.0.0.0:5080"
         let peer = PeerConfig {
             name: "test".into(),
             host: None,
+            port: 5060,
             auth: Some(PeerAuthConfig {
                 username: "user".into(),
                 password: "pass".into(),
@@ -149,6 +158,7 @@ listen: "0.0.0.0:5080"
         let peer = PeerConfig {
             name: "test".into(),
             host: None,
+            port: 5060,
             auth: None,
             codecs: vec![],
         };
@@ -164,6 +174,7 @@ listen: "0.0.0.0:5080"
             peers: vec![PeerConfig {
                 name: "test".into(),
                 host: None,
+                port: 5060,
                 auth: Some(PeerAuthConfig {
                     username: "user".into(),
                     password: "secret".into(),

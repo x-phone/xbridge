@@ -18,11 +18,22 @@ pub(crate) struct SipOutgoing {
     pub addr: SocketAddr,
 }
 
+/// Dialog role — determines From/To handling in outgoing SIP requests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DialogRole {
+    /// UAS (inbound): we received the INVITE, swap From/To in outgoing requests.
+    Uas,
+    /// UAC (outbound): we originated the INVITE, keep From/To as-is.
+    Uac,
+}
+
 /// xphone::Dialog backed by xbridge's trunk SIP transport.
 ///
 /// When xphone's `Call` calls `respond()`, `send_bye()`, etc., this impl builds
 /// the SIP message and enqueues it for async delivery by the server's send task.
 pub(crate) struct TrunkDialog {
+    /// Dialog role (UAS for inbound, UAC for outbound).
+    role: DialogRole,
     /// Channel for outgoing SIP datagrams (bounded to prevent OOM).
     tx: mpsc::Sender<SipOutgoing>,
     /// Remote peer address.
@@ -31,15 +42,19 @@ pub(crate) struct TrunkDialog {
     local_addr: SocketAddr,
     /// SIP Call-ID for this dialog.
     sip_call_id: String,
-    /// Our local to-tag (stable per dialog, RFC 3261).
+    /// Our local tag (stable per dialog, RFC 3261).
     local_tag: String,
-    /// Original INVITE headers (preserved for building responses/requests).
+    /// Remote tag (from 200 OK for UAC, from INVITE for UAS).
+    remote_tag: Mutex<String>,
+    /// Our From header value.
+    local_from: String,
+    /// Remote To header value.
+    remote_to: String,
+    /// Original INVITE Via header (UAS uses for responses).
     invite_via: String,
-    invite_from: String,
-    invite_to: String,
     invite_cseq_num: u32,
-    /// Request-URI from the INVITE (used for BYE Contact routing).
-    contact_uri: String,
+    /// Request-URI for in-dialog requests (BYE, re-INVITE, etc.).
+    contact_uri: Mutex<String>,
     /// Headers from the INVITE (for `header()`/`headers()` methods).
     invite_headers: HashMap<String, Vec<String>>,
     /// CSeq counter for outgoing requests (BYE, re-INVITE, etc.).
@@ -49,7 +64,7 @@ pub(crate) struct TrunkDialog {
 }
 
 impl TrunkDialog {
-    /// Create a new TrunkDialog from an incoming INVITE.
+    /// Create a UAS dialog from an incoming INVITE.
     pub(crate) fn new(
         tx: mpsc::Sender<SipOutgoing>,
         local_addr: SocketAddr,
@@ -81,28 +96,92 @@ impl TrunkDialog {
         };
 
         Self {
+            role: DialogRole::Uas,
             tx,
             remote_addr,
             local_addr,
             sip_call_id: invite.call_id().to_string(),
             local_tag,
+            remote_tag: Mutex::new(String::new()),
+            // UAS: our From is the INVITE's To (we're the callee).
+            local_from: invite.header("To").to_string(),
+            remote_to: invite.header("From").to_string(),
             invite_via: invite.header("Via").to_string(),
-            invite_from: invite.header("From").to_string(),
-            invite_to: invite.header("To").to_string(),
             invite_cseq_num: cseq_num,
-            contact_uri,
+            contact_uri: Mutex::new(contact_uri),
             invite_headers: headers,
             cseq_counter: Mutex::new(cseq_num),
             on_notify_fn: Mutex::new(None),
         }
     }
 
-    /// Build and enqueue a SIP response.
+    /// Create a UAC dialog for an outbound call to a peer.
+    pub(crate) fn new_outbound(
+        tx: mpsc::Sender<SipOutgoing>,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        sip_call_id: String,
+        local_tag: String,
+        from_header: String,
+        to_header: String,
+    ) -> Self {
+        // UAC contact_uri: initially the request-URI (updated from 200 OK Contact).
+        let contact_uri = format!("sip:{}@{}", extract_uri(&to_header), remote_addr);
+
+        // Store From/To as headers for the Dialog trait.
+        let mut headers = HashMap::with_capacity(3);
+        headers.insert("from".into(), vec![from_header.clone()]);
+        headers.insert("to".into(), vec![to_header.clone()]);
+        headers.insert("call-id".into(), vec![sip_call_id.clone()]);
+
+        Self {
+            role: DialogRole::Uac,
+            tx,
+            remote_addr,
+            local_addr,
+            sip_call_id,
+            local_tag,
+            remote_tag: Mutex::new(String::new()),
+            local_from: from_header,
+            remote_to: to_header,
+            invite_via: String::new(),
+            invite_cseq_num: 1,
+            contact_uri: Mutex::new(contact_uri),
+            invite_headers: headers,
+            cseq_counter: Mutex::new(1),
+            on_notify_fn: Mutex::new(None),
+        }
+    }
+
+    /// Update dialog state from a received SIP response (for UAC).
+    /// Captures the remote tag and Contact URI from 1xx/2xx responses.
+    pub(crate) fn update_from_response(&self, resp: &SipMessage) {
+        // Extract remote tag from To header.
+        let to = resp.header("To");
+        if let Some(tag) = extract_tag(to) {
+            let mut remote_tag = self.remote_tag.lock().unwrap();
+            if remote_tag.is_empty() {
+                *remote_tag = tag.to_string();
+            }
+        }
+        // Update contact URI from Contact header.
+        let contact = resp.header("Contact");
+        if !contact.is_empty() {
+            *self.contact_uri.lock().unwrap() = extract_uri(contact).to_string();
+        }
+    }
+
+    /// Build and enqueue a SIP response (UAS only).
     fn send_response(&self, code: u16, reason: &str, body: &[u8]) -> xphone::Result<()> {
+        if self.role == DialogRole::Uac {
+            // UAC doesn't send responses to INVITEs.
+            return Ok(());
+        }
         let mut resp = SipMessage::new_response(code, reason);
         resp.add_header("Via", &self.invite_via);
-        resp.set_header("From", &self.invite_from);
-        resp.set_header("To", &self.to_with_tag());
+        // UAS response: From = INVITE's From (remote), To = INVITE's To (us) + our tag.
+        resp.set_header("From", &self.remote_to);
+        resp.set_header("To", &self.local_from_with_tag());
         resp.set_header("Call-ID", &self.sip_call_id);
         resp.set_header(
             "CSeq",
@@ -120,18 +199,23 @@ impl TrunkDialog {
     }
 
     /// Build and enqueue a SIP request (BYE, re-INVITE, REFER, INFO).
-    fn send_sip_request(&self, method: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> xphone::Result<()> {
+    pub(crate) fn send_sip_request(&self, method: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> xphone::Result<()> {
         let branch = generate_branch();
         let cseq = self.next_cseq();
+        let contact_uri = self.contact_uri.lock().unwrap().clone();
 
-        let mut req = SipMessage::new_request(method, &self.contact_uri);
+        let mut req = SipMessage::new_request(method, &contact_uri);
         req.set_header(
             "Via",
             &format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch),
         );
-        // In a UAS dialog, From/To are swapped for outgoing requests.
-        req.set_header("From", &self.to_with_tag());
-        req.set_header("To", &self.invite_from);
+
+        // Both roles use local_from (with our tag) as From,
+        // and remote_to (with their tag) as To.
+        let remote_tag = self.remote_tag.lock().unwrap().clone();
+        req.set_header("From", &self.local_from_with_tag());
+        req.set_header("To", &append_tag(&self.remote_to, &remote_tag));
+
         req.set_header("Call-ID", &self.sip_call_id);
         req.set_header("CSeq", &format!("{} {}", cseq, method));
         req.set_header(
@@ -157,11 +241,12 @@ impl TrunkDialog {
             .map_err(|_| xphone::Error::Other("trunk send channel full or closed".into()))
     }
 
-    fn to_with_tag(&self) -> String {
-        if self.invite_to.contains("tag=") {
-            self.invite_to.clone()
+    /// Our From header with our local tag appended.
+    fn local_from_with_tag(&self) -> String {
+        if self.local_from.contains("tag=") {
+            self.local_from.clone()
         } else {
-            format!("{};tag={}", self.invite_to, self.local_tag)
+            format!("{};tag={}", self.local_from, self.local_tag)
         }
     }
 
@@ -182,8 +267,10 @@ impl xphone::dialog::Dialog for TrunkDialog {
     }
 
     fn send_cancel(&self) -> xphone::Result<()> {
-        // UAS cannot send CANCEL (only UAC can).
-        Err(xphone::Error::InvalidState)
+        if self.role == DialogRole::Uas {
+            return Err(xphone::Error::InvalidState);
+        }
+        self.send_sip_request("CANCEL", &[], &[])
     }
 
     fn send_reinvite(&self, sdp: &[u8]) -> xphone::Result<()> {
@@ -237,13 +324,30 @@ impl xphone::dialog::Dialog for TrunkDialog {
 
 /// Extract a bare SIP URI from a header value.
 /// `<sip:1001@10.0.0.1:5060>` → `sip:1001@10.0.0.1:5060`
-fn extract_uri(header_val: &str) -> &str {
+pub(crate) fn extract_uri(header_val: &str) -> &str {
     if let Some(start) = header_val.find('<') {
         if let Some(end) = header_val[start..].find('>') {
             return &header_val[start + 1..start + end];
         }
     }
     header_val.trim()
+}
+
+/// Extract the tag value from a From/To header.
+/// `<sip:1001@pbx.local>;tag=abc123` → `Some("abc123")`
+fn extract_tag(header_val: &str) -> Option<&str> {
+    let tag_start = header_val.find("tag=")?;
+    let val = &header_val[tag_start + 4..];
+    Some(val.split(|c: char| c == ';' || c == ',' || c.is_whitespace()).next().unwrap_or(val))
+}
+
+/// Append a tag to a From/To header if not already present and tag is non-empty.
+fn append_tag(header_val: &str, tag: &str) -> String {
+    if tag.is_empty() || header_val.contains("tag=") {
+        header_val.to_string()
+    } else {
+        format!("{};tag={}", header_val, tag)
+    }
 }
 
 #[cfg(test)]
@@ -464,6 +568,102 @@ mod tests {
         assert_eq!(
             extract_uri("<sip:1001@10.0.0.1:5060>;transport=udp"),
             "sip:1001@10.0.0.1:5060"
+        );
+    }
+
+    // ── UAC (outbound) dialog tests ──
+
+    fn make_uac_dialog() -> (TrunkDialog, mpsc::Receiver<SipOutgoing>) {
+        let (tx, rx) = mpsc::channel(64);
+        let dialog = TrunkDialog::new_outbound(
+            tx,
+            "127.0.0.1:5080".parse().unwrap(),
+            "10.0.0.1:5060".parse().unwrap(),
+            "outbound-call-id@xbridge".into(),
+            "uactag456".into(),
+            "<sip:1001@127.0.0.1:5080>".into(),
+            "<sip:1002@10.0.0.1:5060>".into(),
+        );
+        (dialog, rx)
+    }
+
+    #[test]
+    fn uac_respond_is_noop() {
+        let (dialog, mut rx) = make_uac_dialog();
+        dialog.respond(200, "OK", b"v=0\r\n").unwrap();
+        // UAC respond is a no-op — nothing enqueued.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn uac_send_bye_no_swap() {
+        let (dialog, mut rx) = make_uac_dialog();
+        dialog.send_bye().unwrap();
+
+        let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
+        assert_eq!(msg.method, "BYE");
+        assert_eq!(msg.header("Call-ID"), "outbound-call-id@xbridge");
+        // UAC: From is our local party (with our tag).
+        assert!(msg.header("From").contains("1001@127.0.0.1:5080"));
+        assert!(msg.header("From").contains("tag=uactag456"));
+        // UAC: To is the remote party.
+        assert!(msg.header("To").contains("1002@10.0.0.1:5060"));
+    }
+
+    #[test]
+    fn uac_send_cancel_works() {
+        let (dialog, mut rx) = make_uac_dialog();
+        dialog.send_cancel().unwrap();
+
+        let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
+        assert_eq!(msg.method, "CANCEL");
+        assert_eq!(msg.header("Call-ID"), "outbound-call-id@xbridge");
+    }
+
+    #[test]
+    fn uac_update_from_response_captures_remote_tag() {
+        let (dialog, mut rx) = make_uac_dialog();
+
+        // Simulate receiving a 200 OK with a To tag.
+        let mut resp = SipMessage::new_response(200, "OK");
+        resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=remotetag789");
+        resp.set_header("Contact", "<sip:1002@10.0.0.1:5060>");
+        dialog.update_from_response(&resp);
+
+        // Now send BYE — To header should include remote tag.
+        dialog.send_bye().unwrap();
+        let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
+        assert!(msg.header("To").contains("tag=remotetag789"));
+    }
+
+    #[test]
+    fn uac_call_id() {
+        let (dialog, _rx) = make_uac_dialog();
+        assert_eq!(dialog.call_id(), "outbound-call-id@xbridge");
+    }
+
+    #[test]
+    fn extract_tag_from_header() {
+        assert_eq!(extract_tag("<sip:1001@pbx.local>;tag=abc123"), Some("abc123"));
+        assert_eq!(extract_tag("<sip:1001@pbx.local>"), None);
+        assert_eq!(extract_tag("<sip:1001@pbx.local>;tag=abc;param=x"), Some("abc"));
+    }
+
+    #[test]
+    fn append_tag_to_header() {
+        assert_eq!(
+            append_tag("<sip:1001@pbx.local>", "newtag"),
+            "<sip:1001@pbx.local>;tag=newtag"
+        );
+        // Existing tag is preserved.
+        assert_eq!(
+            append_tag("<sip:1001@pbx.local>;tag=existing", "newtag"),
+            "<sip:1001@pbx.local>;tag=existing"
+        );
+        // Empty tag is a no-op.
+        assert_eq!(
+            append_tag("<sip:1001@pbx.local>", ""),
+            "<sip:1001@pbx.local>"
         );
     }
 }
