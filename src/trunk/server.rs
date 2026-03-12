@@ -644,6 +644,162 @@ mod tests {
     }
 
     #[test]
+    fn send_ack_uses_contact_for_request_uri() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut ok_resp = SipMessage::new_response(200, "OK");
+        ok_resp.set_header("From", "<sip:1001@127.0.0.1:5080>;tag=local1");
+        ok_resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=remote1");
+        ok_resp.set_header("Call-ID", "ack-test@xbridge");
+        ok_resp.set_header("CSeq", "1 INVITE");
+        ok_resp.set_header("Contact", "<sip:1002@10.0.0.1:5060>");
+
+        send_ack(&tx, &ok_resp, "ack-test@xbridge", "127.0.0.1:5080".parse().unwrap());
+
+        let outgoing = rx.try_recv().unwrap();
+        let msg = sip_msg::parse(&outgoing.data).unwrap();
+        assert_eq!(msg.method, "ACK");
+        assert_eq!(msg.request_uri, "sip:1002@10.0.0.1:5060");
+        assert_eq!(msg.header("Call-ID"), "ack-test@xbridge");
+        assert_eq!(msg.header("CSeq"), "1 ACK");
+        assert!(msg.header("From").contains("tag=local1"));
+        assert!(msg.header("To").contains("tag=remote1"));
+        assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn send_ack_falls_back_to_to_header() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut ok_resp = SipMessage::new_response(200, "OK");
+        ok_resp.set_header("From", "<sip:1001@127.0.0.1:5080>;tag=local1");
+        ok_resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=remote1");
+        ok_resp.set_header("Call-ID", "ack-test@xbridge");
+        ok_resp.set_header("CSeq", "1 INVITE");
+        // No Contact header.
+
+        send_ack(&tx, &ok_resp, "ack-test@xbridge", "127.0.0.1:5080".parse().unwrap());
+
+        let outgoing = rx.try_recv().unwrap();
+        let msg = sip_msg::parse(&outgoing.data).unwrap();
+        assert_eq!(msg.method, "ACK");
+        assert_eq!(msg.request_uri, "sip:1002@10.0.0.1:5060");
+    }
+
+    #[tokio::test]
+    async fn handle_response_ignores_non_invite() {
+        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (sip_tx, _rx) = mpsc::channel(64);
+
+        let mut resp = SipMessage::new_response(200, "OK");
+        resp.set_header("Call-ID", "test@host");
+        resp.set_header("CSeq", "1 BYE");
+
+        // Should return early without panicking (no dialog needed).
+        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn handle_response_ignores_unknown_call_id() {
+        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (sip_tx, _rx) = mpsc::channel(64);
+
+        let mut resp = SipMessage::new_response(180, "Ringing");
+        resp.set_header("Call-ID", "unknown@host");
+        resp.set_header("CSeq", "1 INVITE");
+
+        // Should return early without panicking.
+        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn handle_response_error_removes_dialog() {
+        use crate::trunk::dialog::TrunkDialog;
+        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (sip_tx, _rx) = mpsc::channel(64);
+        let (dlg_tx, _dlg_rx) = mpsc::channel(64);
+
+        let trunk_dialog = Arc::new(TrunkDialog::new_outbound(
+            dlg_tx,
+            "127.0.0.1:5080".parse().unwrap(),
+            "10.0.0.1:5060".parse().unwrap(),
+            "reject-test@xbridge".into(),
+            "tag1".into(),
+            "<sip:1001@127.0.0.1:5080>".into(),
+            "<sip:1002@10.0.0.1:5060>".into(),
+        ));
+        let call = xphone::Call::new_outbound(
+            trunk_dialog.clone() as Arc<dyn xphone::dialog::Dialog>,
+            xphone::DialOptions::default(),
+        );
+
+        dialogs.write().await.insert(
+            "reject-test@xbridge".into(),
+            TrunkDialogEntry {
+                xbridge_call_id: Some("trunk-test".into()),
+                xphone_call: Some(call),
+                trunk_dialog: Some(trunk_dialog),
+            },
+        );
+
+        let mut resp = SipMessage::new_response(486, "Busy Here");
+        resp.set_header("Call-ID", "reject-test@xbridge");
+        resp.set_header("CSeq", "1 INVITE");
+
+        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
+
+        // Dialog should be removed after error response.
+        assert!(dialogs.read().await.get("reject-test@xbridge").is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_response_200_sends_ack() {
+        use crate::trunk::dialog::TrunkDialog;
+        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (sip_tx, mut sip_rx) = mpsc::channel(64);
+        let (dlg_tx, _dlg_rx) = mpsc::channel(64);
+
+        let trunk_dialog = Arc::new(TrunkDialog::new_outbound(
+            dlg_tx,
+            "127.0.0.1:5080".parse().unwrap(),
+            "10.0.0.1:5060".parse().unwrap(),
+            "ok-test@xbridge".into(),
+            "tag1".into(),
+            "<sip:1001@127.0.0.1:5080>".into(),
+            "<sip:1002@10.0.0.1:5060>".into(),
+        ));
+        let call = xphone::Call::new_outbound(
+            trunk_dialog.clone() as Arc<dyn xphone::dialog::Dialog>,
+            xphone::DialOptions::default(),
+        );
+
+        dialogs.write().await.insert(
+            "ok-test@xbridge".into(),
+            TrunkDialogEntry {
+                xbridge_call_id: Some("trunk-ok".into()),
+                xphone_call: Some(call),
+                trunk_dialog: Some(trunk_dialog),
+            },
+        );
+
+        let mut resp = SipMessage::new_response(200, "OK");
+        resp.set_header("Call-ID", "ok-test@xbridge");
+        resp.set_header("CSeq", "1 INVITE");
+        resp.set_header("Contact", "<sip:1002@10.0.0.1:5060>");
+        resp.set_header("From", "<sip:1001@127.0.0.1:5080>;tag=tag1");
+        resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=remote1");
+        resp.body = b"v=0\r\n".to_vec();
+
+        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
+
+        // ACK should be sent.
+        let outgoing = sip_rx.try_recv().unwrap();
+        let ack = sip_msg::parse(&outgoing.data).unwrap();
+        assert_eq!(ack.method, "ACK");
+        assert_eq!(ack.header("Call-ID"), "ok-test@xbridge");
+        // Dialog should still exist (not removed on success).
+        assert!(dialogs.read().await.get("ok-test@xbridge").is_some());
+    }
+
+    #[test]
     fn parse_addr_from_sip_uri() {
         assert_eq!(
             parse_addr_from_uri("sip:1001@10.0.0.1:5060"),

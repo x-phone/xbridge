@@ -643,6 +643,47 @@ mod tests {
     }
 
     #[test]
+    fn uac_update_does_not_overwrite_remote_tag() {
+        let (dialog, _rx) = make_uac_dialog();
+
+        let mut resp1 = SipMessage::new_response(180, "Ringing");
+        resp1.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=first");
+        dialog.update_from_response(&resp1);
+
+        let mut resp2 = SipMessage::new_response(200, "OK");
+        resp2.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=second");
+        resp2.set_header("Contact", "<sip:1002@10.0.0.1:5060>");
+        dialog.update_from_response(&resp2);
+
+        // First tag should be preserved (not overwritten).
+        assert_eq!(*dialog.remote_tag.lock().unwrap(), "first");
+    }
+
+    #[test]
+    fn uac_update_skips_response_without_tag() {
+        let (dialog, _rx) = make_uac_dialog();
+
+        let mut resp = SipMessage::new_response(100, "Trying");
+        resp.set_header("To", "<sip:1002@10.0.0.1:5060>");
+        dialog.update_from_response(&resp);
+
+        // Remote tag should still be empty.
+        assert!(dialog.remote_tag.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uac_update_captures_contact_uri() {
+        let (dialog, _rx) = make_uac_dialog();
+
+        let mut resp = SipMessage::new_response(200, "OK");
+        resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=t1");
+        resp.set_header("Contact", "<sip:1002@192.168.1.100:5060>");
+        dialog.update_from_response(&resp);
+
+        assert_eq!(*dialog.contact_uri.lock().unwrap(), "sip:1002@192.168.1.100:5060");
+    }
+
+    #[test]
     fn extract_tag_from_header() {
         assert_eq!(extract_tag("<sip:1001@pbx.local>;tag=abc123"), Some("abc123"));
         assert_eq!(extract_tag("<sip:1001@pbx.local>"), None);

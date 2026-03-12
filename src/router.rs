@@ -1980,6 +1980,134 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── Peer call error paths ──
+
+    #[tokio::test]
+    async fn create_call_to_peer_no_server_config_returns_404() {
+        let state = test_state(); // server: None
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"to":"+15551234567","from":"+15559876543","peer":"office-pbx"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_call_to_peer_unknown_peer_returns_404() {
+        let mut config = test_config();
+        config.server = Some(crate::trunk::config::ServerConfig {
+            listen: "0.0.0.0:5080".into(),
+            peers: vec![],
+            rtp_port_min: 0,
+            rtp_port_max: 0,
+        });
+        let webhook = WebhookClient::new(&config.webhook);
+        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
+        let (state_tx, _) = tokio::sync::mpsc::channel(32);
+        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"to":"+15551234567","from":"+15559876543","peer":"nonexistent"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_call_to_peer_no_host_returns_422() {
+        let mut config = test_config();
+        config.server = Some(crate::trunk::config::ServerConfig {
+            listen: "0.0.0.0:5080".into(),
+            peers: vec![crate::trunk::config::PeerConfig {
+                name: "no-host".into(),
+                host: None,
+                port: 5060,
+                auth: None,
+                codecs: vec![],
+            }],
+            rtp_port_min: 0,
+            rtp_port_max: 0,
+        });
+        let webhook = WebhookClient::new(&config.webhook);
+        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
+        let (state_tx, _) = tokio::sync::mpsc::channel(32);
+        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"to":"+15551234567","from":"+15559876543","peer":"no-host"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn create_call_to_peer_trunk_not_running_returns_503() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut config = test_config();
+        config.server = Some(crate::trunk::config::ServerConfig {
+            listen: "0.0.0.0:5080".into(),
+            peers: vec![crate::trunk::config::PeerConfig {
+                name: "office".into(),
+                host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                port: 5060,
+                auth: None,
+                codecs: vec![],
+            }],
+            rtp_port_min: 0,
+            rtp_port_max: 0,
+        });
+        let webhook = WebhookClient::new(&config.webhook);
+        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
+        let (state_tx, _) = tokio::sync::mpsc::channel(32);
+        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+        // trunk_sip_tx is None (server not started) → 503
+
+        let resp = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/calls")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"to":"+15551234567","from":"+15559876543","peer":"office"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     // ── Webhook DLQ endpoints ──
 
     #[tokio::test]
