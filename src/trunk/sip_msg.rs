@@ -124,16 +124,7 @@ impl SipMessage {
 
     /// Parses the CSeq header into (sequence number, method).
     pub fn cseq(&self) -> (u32, &str) {
-        let val = self.header("CSeq").trim();
-        if val.is_empty() {
-            return (0, "");
-        }
-        if let Some(space) = val.find(' ') {
-            if let Ok(n) = val[..space].parse() {
-                return (n, &val[space + 1..]);
-            }
-        }
-        (0, "")
+        parse_cseq(self.header("CSeq"))
     }
 
     /// Returns the Call-ID header value.
@@ -171,7 +162,7 @@ impl SipMessage {
 
     /// Serialize to SIP wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = String::new();
+        let mut buf = String::with_capacity(256);
 
         if self.is_response() {
             let _ = write!(buf, "SIP/2.0 {} {}\r\n", self.status_code, self.reason);
@@ -273,16 +264,31 @@ pub fn parse(data: &[u8]) -> Result<SipMessage, ParseError> {
     Ok(msg)
 }
 
-/// Extract a parameter value from a SIP header value.
+/// Parse a raw CSeq header value into (sequence number, method).
+/// E.g., `"1 INVITE"` → `(1, "INVITE")`
+pub fn parse_cseq(val: &str) -> (u32, &str) {
+    let val = val.trim();
+    if val.is_empty() {
+        return (0, "");
+    }
+    if let Some(space) = val.find(' ') {
+        if let Ok(n) = val[..space].parse() {
+            return (n, &val[space + 1..]);
+        }
+    }
+    (0, "")
+}
+
+/// Extract a parameter value from a SIP header value (zero-allocation).
 /// E.g., `param_value("SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK123", "branch")` → `"z9hG4bK123"`
 fn param_value<'a>(header_val: &'a str, param: &str) -> &'a str {
-    let search = format!("{}=", param);
     for part in header_val.split(';') {
         let trimmed = part.trim();
-        if trimmed.len() >= search.len()
-            && trimmed[..search.len()].eq_ignore_ascii_case(&search)
+        if trimmed.len() > param.len()
+            && trimmed.as_bytes()[param.len()] == b'='
+            && trimmed[..param.len()].eq_ignore_ascii_case(param)
         {
-            let val = &trimmed[search.len()..];
+            let val = &trimmed[param.len() + 1..];
             let end = val.find([',', ' ', '\t', '>']);
             return match end {
                 Some(e) => &val[..e],

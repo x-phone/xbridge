@@ -1,9 +1,11 @@
 services:
   xbridge:
-    image: ghcr.io/x-phone/xbridge:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
-      - "10000-10100:10000-10100/udp"
+      - "10200-10300:10200-10300/udp"
     volumes:
       - ./config.yaml:/etc/xbridge/config.yaml:ro
     environment:

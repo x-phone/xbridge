@@ -148,18 +148,8 @@ fn md5_hex(input: &str) -> String {
 
 fn generate_nonce() -> String {
     use rand::Rng;
-    let mut rng = rand::rng();
-    let bytes: [u8; 16] = rng.random();
-    hex_encode(&bytes)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
+    let bytes: [u8; 16] = rand::rng().random();
+    crate::trunk::util::hex_encode(&bytes)
 }
 
 /// Build a 401 WWW-Authenticate header value for digest auth challenge.

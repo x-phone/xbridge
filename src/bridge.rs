@@ -243,11 +243,7 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
         }
         IncomingCallAction::Reject => {
             let reason = response.reason.as_deref().unwrap_or("busy");
-            let code = match reason {
-                "busy" => 486,
-                "declined" => 603,
-                _ => 486,
-            };
+            let code = crate::trunk::util::reject_reason_to_sip_code(reason);
             tracing::info!("rejecting call {call_id}: {reason}");
             let _ = call.reject(code, reason);
         }
