@@ -37,6 +37,22 @@ stream:
   encoding: "audio/x-mulaw"  # audio/x-mulaw | audio/x-l16
   sample_rate: 8000
 
+# SIP trunk host — accept calls directly from PBX systems
+# server:
+#   listen: "0.0.0.0:5080"
+#   rtp_port_min: 0              # 0 = OS-assigned
+#   rtp_port_max: 0
+#   peers:
+#     - name: "office-pbx"
+#       host: "192.168.1.10"     # IP-based auth
+#       port: 5060               # SIP port for outbound (default: 5060)
+#       codecs: ["ulaw", "alaw"]
+#     - name: "remote-office"
+#       auth:                    # SIP digest auth
+#         username: "remote-trunk"
+#         password: "secret"
+#       codecs: ["ulaw"]
+
 # auth:
 #   api_key: "your-secret-api-key"
 
