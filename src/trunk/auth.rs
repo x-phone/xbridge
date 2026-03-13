@@ -5,6 +5,9 @@ use std::net::IpAddr;
 use crate::trunk::config::{PeerConfig, ServerConfig};
 use crate::trunk::sip_msg::SipMessage;
 
+/// Realm used in SIP digest challenges.
+const REALM: &str = "xbridge";
+
 /// Result of authenticating an incoming SIP request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthResult {
@@ -41,18 +44,17 @@ pub fn authenticate(
     let auth_header = msg.header("Authorization");
     if !auth_header.is_empty() {
         if let Some(digest) = parse_digest_auth(auth_header) {
+            // Reject if realm doesn't match our challenge.
+            if digest.realm != REALM {
+                return AuthResult::Rejected;
+            }
             for peer in &config.peers {
                 if let Some(ref cred) = peer.auth {
                     if cred.username == digest.username {
-                        let realm = &digest.realm;
-                        let expected = compute_digest_response(
-                            &cred.username,
-                            &cred.password,
-                            realm,
-                            &digest.nonce,
-                            &msg.method,
-                            &digest.uri,
-                        );
+                        // Use pre-computed HA1 (cached on first access).
+                        let ha1 = cred.ha1();
+                        let ha2 = md5_hex(&format!("{}:{}", &msg.method, &digest.uri));
+                        let expected = md5_hex(&format!("{ha1}:{}:{ha2}", &digest.nonce));
                         if expected == digest.response {
                             return AuthResult::Authenticated(peer.name.clone());
                         }
@@ -69,7 +71,7 @@ pub fn authenticate(
     if has_digest_peers {
         let nonce = generate_nonce();
         return AuthResult::Challenge {
-            realm: "xbridge".into(),
+            realm: REALM.into(),
             nonce,
         };
     }
@@ -179,10 +181,7 @@ mod tests {
                     name: "remote-office".into(),
                     host: None,
                     port: 5060,
-                    auth: Some(crate::trunk::config::PeerAuthConfig {
-                        username: "remote-trunk".into(),
-                        password: "secret123".into(),
-                    }),
+                    auth: Some(crate::trunk::config::PeerAuthConfig::new("remote-trunk", "secret123")),
                     codecs: vec![],
                 },
             ],
@@ -325,10 +324,7 @@ mod tests {
                 name: "both-auth".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
                 port: 5060,
-                auth: Some(crate::trunk::config::PeerAuthConfig {
-                    username: "user".into(),
-                    password: "pass".into(),
-                }),
+                auth: Some(crate::trunk::config::PeerAuthConfig::new("user", "pass")),
                 codecs: vec![],
             }],
         };
@@ -398,5 +394,33 @@ mod tests {
         // Known correct MD5 digest for these inputs.
         assert!(!response.is_empty());
         assert_eq!(response.len(), 32); // MD5 hex digest length
+    }
+
+    // ── HA1 pre-computation ──
+
+    #[test]
+    fn ha1_precomputed_matches_inline() {
+        let cred = crate::trunk::config::PeerAuthConfig::new("remote-trunk", "secret123");
+        let expected = md5_hex(&format!("remote-trunk:xbridge:secret123"));
+        assert_eq!(cred.ha1(), expected);
+        // Second call returns same cached value.
+        assert_eq!(cred.ha1(), expected);
+    }
+
+    #[test]
+    fn digest_auth_wrong_realm_rejected() {
+        let config = test_config();
+        let nonce = "testnonce123";
+        let realm = "evil-realm";
+        let uri = "sip:1002@xbridge:5080";
+        let response = compute_digest_response(
+            "remote-trunk", "secret123", realm, nonce, "INVITE", uri,
+        );
+        let auth_header = format!(
+            "Digest username=\"remote-trunk\",realm=\"{realm}\",nonce=\"{nonce}\",uri=\"{uri}\",response=\"{response}\""
+        );
+        let msg = make_invite(Some(&auth_header));
+        let result = authenticate(&config, &msg, Ipv4Addr::new(10, 0, 0, 99).into());
+        assert_eq!(result, AuthResult::Rejected);
     }
 }

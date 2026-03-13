@@ -46,6 +46,27 @@ pub struct PeerAuthConfig {
     pub username: String,
     #[serde(skip_serializing)]
     pub password: String,
+    /// Cached HA1 = MD5(username:xbridge:password), lazily computed on first use.
+    #[serde(skip)]
+    ha1_cache: std::sync::OnceLock<String>,
+}
+
+impl PeerAuthConfig {
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+            ha1_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Returns pre-computed HA1 = MD5(username:xbridge:password).
+    pub(crate) fn ha1(&self) -> &str {
+        self.ha1_cache.get_or_init(|| {
+            let input = format!("{}:xbridge:{}", self.username, self.password);
+            format!("{:x}", md5::compute(input.as_bytes()))
+        })
+    }
 }
 
 impl PeerConfig {
@@ -144,10 +165,7 @@ listen: "0.0.0.0:5080"
             name: "test".into(),
             host: None,
             port: 5060,
-            auth: Some(PeerAuthConfig {
-                username: "user".into(),
-                password: "pass".into(),
-            }),
+            auth: Some(PeerAuthConfig::new("user", "pass")),
             codecs: vec![],
         };
         assert!(peer.has_auth());
@@ -175,10 +193,7 @@ listen: "0.0.0.0:5080"
                 name: "test".into(),
                 host: None,
                 port: 5060,
-                auth: Some(PeerAuthConfig {
-                    username: "user".into(),
-                    password: "secret".into(),
-                }),
+                auth: Some(PeerAuthConfig::new("user", "secret")),
                 codecs: vec![],
             }],
         };
