@@ -30,6 +30,8 @@ pub(crate) struct TrunkDialogEntry {
     pub xphone_call: Option<Arc<xphone::Call>>,
     /// TrunkDialog reference (for updating dialog state from SIP responses).
     pub trunk_dialog: Option<Arc<TrunkDialog>>,
+    /// When this entry was created (for TTL reaping).
+    pub created_at: std::time::Instant,
 }
 
 /// Registry of active trunk SIP dialogs, keyed by SIP Call-ID.

@@ -414,6 +414,7 @@ async fn create_call_to_peer(
             xbridge_call_id: Some(call_id.clone()),
             xphone_call: Some(call.clone()),
             trunk_dialog: Some(dialog),
+            created_at: std::time::Instant::now(),
         },
     );
 

@@ -51,6 +51,12 @@ pub async fn run(
         }
     });
 
+    // Spawn dialog TTL reaper — cleans up leaked entries.
+    let reaper_dialogs = dialogs.clone();
+    tokio::spawn(async move {
+        reap_stale_dialogs(reaper_dialogs).await;
+    });
+
     let mut buf = vec![0u8; 65535];
 
     loop {
@@ -134,6 +140,7 @@ async fn handle_invite(
                     xbridge_call_id: None,
                     xphone_call: None,
                     trunk_dialog: None,
+                    created_at: std::time::Instant::now(),
                 },
             );
 
@@ -386,6 +393,51 @@ async fn handle_cancel(
         resp.set_header("CSeq", &format!("{seq} INVITE"));
         let data = resp.to_bytes();
         let _ = socket.send_to(&data, addr).await;
+    }
+}
+
+/// TTL thresholds for dialog reaping.
+const SETUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const ACTIVE_TTL: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Periodically scan trunk dialogs and remove entries that have exceeded their TTL.
+///
+/// - Entries still in setup (no xphone_call): 30 seconds — covers webhook hang, RTP failure.
+/// - Active entries (xphone_call present): 4 hours — safety net for vanished peers.
+async fn reap_stale_dialogs(dialogs: TrunkDialogMap) {
+    loop {
+        tokio::time::sleep(REAP_INTERVAL).await;
+
+        let now = std::time::Instant::now();
+        let mut dialogs = dialogs.write().await;
+        let before = dialogs.len();
+
+        dialogs.retain(|sip_call_id, entry| {
+            let age = now.duration_since(entry.created_at);
+            let ttl = if entry.xphone_call.is_some() {
+                ACTIVE_TTL
+            } else {
+                SETUP_TTL
+            };
+            if age > ttl {
+                warn!(
+                    "reaping stale dialog {sip_call_id} (age={age:.0?}, call_id={:?})",
+                    entry.xbridge_call_id
+                );
+                if let Some(ref call) = entry.xphone_call {
+                    call.simulate_bye();
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        let reaped = before - dialogs.len();
+        if reaped > 0 {
+            info!("reaped {reaped} stale trunk dialog(s)");
+        }
     }
 }
 
@@ -737,6 +789,7 @@ mod tests {
                 xbridge_call_id: Some("trunk-test".into()),
                 xphone_call: Some(call),
                 trunk_dialog: Some(trunk_dialog),
+                created_at: std::time::Instant::now(),
             },
         );
 
@@ -777,6 +830,7 @@ mod tests {
                 xbridge_call_id: Some("trunk-ok".into()),
                 xphone_call: Some(call),
                 trunk_dialog: Some(trunk_dialog),
+                created_at: std::time::Instant::now(),
             },
         );
 
@@ -839,5 +893,103 @@ mod tests {
         assert_eq!(msg.header("Content-Type"), "application/sdp");
         assert_eq!(String::from_utf8_lossy(&msg.body), "v=0\r\n");
         assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn reaper_removes_stale_setup_entry() {
+        let dialogs: TrunkDialogMap =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+        // Insert an entry with a created_at far in the past (simulates stuck setup).
+        dialogs.write().await.insert(
+            "stale-setup@xbridge".into(),
+            TrunkDialogEntry {
+                xbridge_call_id: None,
+                xphone_call: None,
+                trunk_dialog: None,
+                created_at: std::time::Instant::now() - SETUP_TTL - std::time::Duration::from_secs(1),
+            },
+        );
+
+        // Insert a fresh entry that should survive.
+        dialogs.write().await.insert(
+            "fresh@xbridge".into(),
+            TrunkDialogEntry {
+                xbridge_call_id: Some("trunk-fresh".into()),
+                xphone_call: None,
+                trunk_dialog: None,
+                created_at: std::time::Instant::now(),
+            },
+        );
+
+        assert_eq!(dialogs.read().await.len(), 2);
+
+        // Run one reap cycle inline (extract the retain logic).
+        {
+            let now = std::time::Instant::now();
+            let mut map = dialogs.write().await;
+            map.retain(|_, entry| {
+                let age = now.duration_since(entry.created_at);
+                let ttl = if entry.xphone_call.is_some() {
+                    ACTIVE_TTL
+                } else {
+                    SETUP_TTL
+                };
+                age <= ttl
+            });
+        }
+
+        assert_eq!(dialogs.read().await.len(), 1);
+        assert!(dialogs.read().await.get("stale-setup@xbridge").is_none());
+        assert!(dialogs.read().await.get("fresh@xbridge").is_some());
+    }
+
+    #[tokio::test]
+    async fn reaper_removes_stale_active_entry() {
+        use crate::trunk::dialog::TrunkDialog;
+        let dialogs: TrunkDialogMap =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (dlg_tx, _dlg_rx) = mpsc::channel(64);
+
+        let trunk_dialog = Arc::new(TrunkDialog::new_outbound(
+            dlg_tx,
+            "127.0.0.1:5080".parse().unwrap(),
+            "10.0.0.1:5060".parse().unwrap(),
+            "stale-active@xbridge".into(),
+            "tag1".into(),
+            "<sip:1001@127.0.0.1:5080>".into(),
+            "<sip:1002@10.0.0.1:5060>".into(),
+        ));
+        let call = xphone::Call::new_outbound(
+            trunk_dialog.clone() as Arc<dyn xphone::dialog::Dialog>,
+            xphone::DialOptions::default(),
+        );
+
+        // Active entry but created 4+ hours ago.
+        dialogs.write().await.insert(
+            "stale-active@xbridge".into(),
+            TrunkDialogEntry {
+                xbridge_call_id: Some("trunk-stale".into()),
+                xphone_call: Some(call),
+                trunk_dialog: Some(trunk_dialog),
+                created_at: std::time::Instant::now() - ACTIVE_TTL - std::time::Duration::from_secs(1),
+            },
+        );
+
+        {
+            let now = std::time::Instant::now();
+            let mut map = dialogs.write().await;
+            map.retain(|_, entry| {
+                let age = now.duration_since(entry.created_at);
+                let ttl = if entry.xphone_call.is_some() {
+                    ACTIVE_TTL
+                } else {
+                    SETUP_TTL
+                };
+                age <= ttl
+            });
+        }
+
+        assert!(dialogs.read().await.is_empty());
     }
 }
