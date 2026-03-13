@@ -45,6 +45,8 @@ pub async fn run(
     let send_socket = socket.clone();
     tokio::spawn(async move {
         while let Some(msg) = sip_rx.recv().await {
+            let preview = String::from_utf8_lossy(&msg.data[..msg.data.len().min(1024)]);
+            debug!("trunk SIP >>> sending {} bytes to {}:\n{}", msg.data.len(), msg.addr, preview);
             if let Err(e) = send_socket.send_to(&msg.data, msg.addr).await {
                 warn!("trunk SIP send error: {e}");
             }
@@ -151,7 +153,13 @@ async fn handle_invite(
             let sip_tx = sip_tx.clone();
             let rtp_port_min = config.rtp_port_min;
             let rtp_port_max = config.rtp_port_max;
-            let rtp_address = config.rtp_address;
+            // Per-peer rtp_address takes priority over server-level rtp_address.
+            let rtp_address = config
+                .peers
+                .iter()
+                .find(|p| p.name == peer_name)
+                .and_then(|p| p.rtp_address)
+                .or(config.rtp_address);
             tokio::spawn(async move {
                 handle_trunk_incoming(
                     &msg,

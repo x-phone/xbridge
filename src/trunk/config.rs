@@ -26,9 +26,13 @@ pub struct ServerConfig {
 pub struct PeerConfig {
     /// Human-readable name for this peer (e.g., "office-pbx").
     pub name: String,
-    /// IP address for IP-based authentication. If set, INVITEs from this IP are accepted.
+    /// Single IP address for IP-based authentication (simple case).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<IpAddr>,
+    /// Multiple IPs or CIDR ranges for IP-based authentication.
+    /// Supports exact IPs ("54.172.60.1") and CIDRs ("54.172.60.0/22").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
     /// SIP port for outbound calls to this peer. Defaults to 5060.
     #[serde(default = "default_sip_port")]
     pub port: u16,
@@ -38,6 +42,10 @@ pub struct PeerConfig {
     /// Allowed codecs (e.g., ["ulaw", "alaw"]). Empty means accept any.
     #[serde(default)]
     pub codecs: Vec<String>,
+    /// Per-peer RTP address override. If set, SDP for calls from this peer
+    /// uses this address instead of the server-level `rtp_address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtp_address: Option<IpAddr>,
 }
 
 fn default_sip_port() -> u16 {
@@ -76,7 +84,41 @@ impl PeerAuthConfig {
 impl PeerConfig {
     /// Returns true if this peer has at least one auth method configured.
     pub fn has_auth(&self) -> bool {
-        self.host.is_some() || self.auth.is_some()
+        self.host.is_some() || !self.hosts.is_empty() || self.auth.is_some()
+    }
+
+    /// Returns true if the given IP matches this peer's `host` or any entry in `hosts`.
+    pub fn matches_ip(&self, ip: IpAddr) -> bool {
+        if self.host == Some(ip) {
+            return true;
+        }
+        self.hosts.iter().any(|entry| cidr_matches(entry, ip))
+    }
+}
+
+/// Check if an IP matches a CIDR string ("10.0.0.0/8") or exact IP string ("10.0.0.1").
+fn cidr_matches(entry: &str, ip: IpAddr) -> bool {
+    if let Some((net_str, prefix_str)) = entry.split_once('/') {
+        let Ok(net_ip) = net_str.parse::<IpAddr>() else { return false };
+        let Ok(prefix_len) = prefix_str.parse::<u32>() else { return false };
+        match (net_ip, ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                if prefix_len > 32 { return false; }
+                if prefix_len == 0 { return true; }
+                let mask = u32::MAX << (32 - prefix_len);
+                (u32::from(net) & mask) == (u32::from(addr) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                if prefix_len > 128 { return false; }
+                if prefix_len == 0 { return true; }
+                let mask = u128::MAX << (128 - prefix_len);
+                (u128::from(net) & mask) == (u128::from(addr) & mask)
+            }
+            _ => false,
+        }
+    } else {
+        // Exact IP match.
+        entry.parse::<IpAddr>().ok() == Some(ip)
     }
 }
 
@@ -156,9 +198,11 @@ listen: "0.0.0.0:5080"
         let peer = PeerConfig {
             name: "test".into(),
             host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            hosts: vec![],
             port: 5060,
             auth: None,
             codecs: vec![],
+            rtp_address: None,
         };
         assert!(peer.has_auth());
     }
@@ -168,9 +212,11 @@ listen: "0.0.0.0:5080"
         let peer = PeerConfig {
             name: "test".into(),
             host: None,
+            hosts: vec![],
             port: 5060,
             auth: Some(PeerAuthConfig::new("user", "pass")),
             codecs: vec![],
+            rtp_address: None,
         };
         assert!(peer.has_auth());
     }
@@ -180,9 +226,11 @@ listen: "0.0.0.0:5080"
         let peer = PeerConfig {
             name: "test".into(),
             host: None,
+            hosts: vec![],
             port: 5060,
             auth: None,
             codecs: vec![],
+            rtp_address: None,
         };
         assert!(!peer.has_auth());
     }
@@ -197,9 +245,11 @@ listen: "0.0.0.0:5080"
             peers: vec![PeerConfig {
                 name: "test".into(),
                 host: None,
+                hosts: vec![],
                 port: 5060,
                 auth: Some(PeerAuthConfig::new("user", "secret")),
                 codecs: vec![],
+                rtp_address: None,
             }],
         };
         let json = serde_json::to_value(&config).unwrap();

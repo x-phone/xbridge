@@ -51,8 +51,8 @@ pub(crate) struct TrunkDialog {
     local_from: String,
     /// Remote To header value.
     remote_to: String,
-    /// Original INVITE Via header (UAS uses for responses).
-    invite_via: String,
+    /// Original INVITE Via headers (UAS uses for responses — all must be preserved).
+    invite_vias: Vec<String>,
     invite_cseq_num: u32,
     /// Request-URI for in-dialog requests (BYE, re-INVITE, etc.).
     contact_uri: Mutex<String>,
@@ -107,7 +107,7 @@ impl TrunkDialog {
             // UAS: our From is the INVITE's To (we're the callee).
             local_from: invite.header("To").to_string(),
             remote_to: invite.header("From").to_string(),
-            invite_via: invite.header("Via").to_string(),
+            invite_vias: invite.header_values("Via").into_iter().map(|v| v.to_string()).collect(),
             invite_cseq_num: cseq_num,
             contact_uri: Mutex::new(contact_uri),
             invite_headers: headers,
@@ -145,7 +145,7 @@ impl TrunkDialog {
             remote_tag: Mutex::new(String::new()),
             local_from: from_header,
             remote_to: to_header,
-            invite_via: String::new(),
+            invite_vias: Vec::new(),
             invite_cseq_num: 1,
             contact_uri: Mutex::new(contact_uri),
             invite_headers: headers,
@@ -179,7 +179,9 @@ impl TrunkDialog {
             return Ok(());
         }
         let mut resp = SipMessage::new_response(code, reason);
-        resp.add_header("Via", &self.invite_via);
+        for via in &self.invite_vias {
+            resp.add_header("Via", via);
+        }
         // UAS response: From = INVITE's From (remote), To = INVITE's To (us) + our tag.
         resp.set_header("From", &self.remote_to);
         resp.set_header("To", &self.local_from_with_tag());
@@ -205,7 +207,16 @@ impl TrunkDialog {
         let cseq = self.next_cseq();
         let contact_uri = self.contact_uri.lock().unwrap().clone();
 
-        let mut req = SipMessage::new_request(method.clone(), &contact_uri);
+        // For UAS (inbound) calls, the INVITE's Contact may contain an internal
+        // proxy IP (e.g. Twilio 172.x.x.x) that's unreachable. Use the edge
+        // proxy address (remote_addr) in the Request-URI so the BYE routes
+        // through the same path as the INVITE.
+        let request_uri = if self.role == DialogRole::Uas {
+            rewrite_uri_host(&contact_uri, &self.remote_addr)
+        } else {
+            contact_uri.clone()
+        };
+        let mut req = SipMessage::new_request(method.clone(), &request_uri);
         req.set_header(
             "Via",
             &format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch),
@@ -321,6 +332,24 @@ impl xphone::dialog::Dialog for TrunkDialog {
     }
 }
 
+/// Rewrite the host:port in a SIP URI to use the given address.
+/// `sip:+19085679691@172.25.62.99:5060;transport=udp` + `54.172.60.0:5060`
+/// → `sip:+19085679691@54.172.60.0:5060;transport=udp`
+fn rewrite_uri_host(uri: &str, addr: &SocketAddr) -> String {
+    // Split on '@' to get user and host parts.
+    if let Some((user_part, host_part)) = uri.split_once('@') {
+        // Preserve any URI parameters after the host (;transport=udp, etc.)
+        let (_, params) = if let Some(semi) = host_part.find(';') {
+            (&host_part[..semi], &host_part[semi..])
+        } else {
+            (host_part, "")
+        };
+        format!("{user_part}@{addr}{params}")
+    } else {
+        uri.to_string()
+    }
+}
+
 /// Extract a bare SIP URI from a header value.
 /// `<sip:1001@10.0.0.1:5060>` → `sip:1001@10.0.0.1:5060`
 pub(crate) fn extract_uri(header_val: &str) -> &str {
@@ -393,6 +422,30 @@ mod tests {
         assert_eq!(msg.header("Content-Type"), "application/sdp");
         assert_eq!(String::from_utf8_lossy(&msg.body), "v=0\r\n");
         assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn respond_preserves_all_via_headers() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut invite = sample_invite();
+        // Add a second Via header (like Twilio's proxied INVITEs).
+        invite.add_header("Via", "SIP/2.0/UDP 172.18.65.254:5060;rport=5060;branch=z9hG4bK222");
+        let dialog = TrunkDialog::new(
+            tx,
+            "127.0.0.1:5080".parse().unwrap(),
+            "10.0.0.1:5060".parse().unwrap(),
+            &invite,
+            "localtag123".into(),
+        );
+        dialog.respond(200, "OK", b"v=0\r\n").unwrap();
+
+        let outgoing = rx.try_recv().unwrap();
+        let msg = sip_msg::parse(&outgoing.data).unwrap();
+
+        let vias = msg.header_values("Via");
+        assert_eq!(vias.len(), 2, "200 OK must preserve all Via headers from INVITE");
+        assert!(vias[0].contains("10.0.0.1:5060"));
+        assert!(vias[1].contains("172.18.65.254:5060"));
     }
 
     #[test]

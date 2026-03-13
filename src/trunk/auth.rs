@@ -33,10 +33,8 @@ pub fn authenticate(
 ) -> AuthResult {
     // Step 1: IP-based auth — fastest path.
     for peer in &config.peers {
-        if let Some(host_ip) = peer.host {
-            if host_ip == source_ip {
-                return AuthResult::Authenticated(peer.name.clone());
-            }
+        if peer.matches_ip(source_ip) {
+            return AuthResult::Authenticated(peer.name.clone());
         }
     }
 
@@ -175,16 +173,20 @@ mod tests {
                 PeerConfig {
                     name: "office-pbx".into(),
                     host: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+                    hosts: vec![],
                     port: 5060,
                     auth: None,
                     codecs: vec![],
+                    rtp_address: None,
                 },
                 PeerConfig {
                     name: "remote-office".into(),
                     host: None,
+                    hosts: vec![],
                     port: 5060,
                     auth: Some(crate::trunk::config::PeerAuthConfig::new("remote-trunk", "secret123")),
                     codecs: vec![],
+                    rtp_address: None,
                 },
             ],
         }
@@ -304,9 +306,11 @@ mod tests {
             peers: vec![PeerConfig {
                 name: "local".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                hosts: vec![],
                 port: 5060,
                 auth: None,
                 codecs: vec![],
+                rtp_address: None,
             }],
         };
         let msg = make_invite(None);
@@ -328,9 +332,11 @@ mod tests {
             peers: vec![PeerConfig {
                 name: "both-auth".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                hosts: vec![],
                 port: 5060,
                 auth: Some(crate::trunk::config::PeerAuthConfig::new("user", "pass")),
                 codecs: vec![],
+                rtp_address: None,
             }],
         };
         let msg = make_invite(None);

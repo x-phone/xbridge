@@ -2045,9 +2045,11 @@ mod tests {
             peers: vec![crate::trunk::config::PeerConfig {
                 name: "no-host".into(),
                 host: None,
+                hosts: vec![],
                 port: 5060,
                 auth: None,
                 codecs: vec![],
+                rtp_address: None,
             }],
             rtp_port_min: 0,
             rtp_port_max: 0,
@@ -2084,9 +2086,11 @@ mod tests {
             peers: vec![crate::trunk::config::PeerConfig {
                 name: "office".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                hosts: vec![],
                 port: 5060,
                 auth: None,
                 codecs: vec![],
+                rtp_address: None,
             }],
             rtp_port_min: 0,
             rtp_port_max: 0,
