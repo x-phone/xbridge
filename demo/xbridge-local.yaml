@@ -1,0 +1,47 @@
+listen:
+  http: "0.0.0.0:8090"
+
+# Register as extension 1002 on xpbx/Asterisk (via published port)
+sip:
+  username: "1002"
+  password: "password123"
+  host: "127.0.0.1"
+  transport: "udp"
+  rtp_port_min: 10300
+  rtp_port_max: 10400
+
+# Trunk host mode — accept SIP from Twilio directly
+server:
+  listen: "0.0.0.0:5080"
+  rtp_port_min: 10200
+  rtp_port_max: 10300
+  rtp_address: "YOUR_PUBLIC_IP"
+  peers:
+    - name: "xpbx"
+      host: "127.0.0.1"
+    - name: "twilio"
+      hosts:
+        # North America Virginia + Oregon
+        - "54.172.60.0/30"
+        - "54.244.51.0/30"
+        # Europe Ireland + Frankfurt
+        - "54.171.127.192/30"
+        - "35.156.191.128/30"
+        # Asia Pacific Tokyo + Singapore + Sydney
+        - "54.65.63.192/30"
+        - "54.169.127.128/30"
+        - "54.252.254.64/30"
+        # South America São Paulo
+        - "177.71.206.192/30"
+      rtp_address: "YOUR_PUBLIC_IP"
+
+# Webhook points to the voice-app (via published port)
+webhook:
+  url: "http://127.0.0.1:3000/webhook"
+  timeout: "5s"
+
+# Audio streaming to the voice-app via WebSocket
+stream:
+  mode: "native"
+  encoding: "audio/x-l16"
+  sample_rate: 8000

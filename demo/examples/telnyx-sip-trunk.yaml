@@ -1,0 +1,41 @@
+# xbridge config — Telnyx SIP Trunk integration
+#
+# This config accepts inbound calls from a Telnyx SIP Trunk (Connection).
+# Telnyx routes PSTN calls to xbridge's trunk host server via IP auth.
+#
+# Setup:
+#   1. Create a Telnyx SIP Connection: https://portal.telnyx.com
+#      - Set Outbound voice profile → FQDN/IP: YOUR_SERVER_IP:5080
+#      - Enable IP authentication, add your server IP to the ACL
+#   2. Buy a phone number and assign it to the connection
+#   3. Open firewall ports: 5080/udp (SIP), 10200-10300/udp (RTP)
+#   4. Set rtp_address to YOUR_SERVER_IP
+#   5. Run xbridge with this config
+#
+# Telnyx signaling IPs:
+#   https://support.telnyx.com/en/articles/4175598-telnyx-sip-signaling-ip-addresses
+
+listen:
+  http: "0.0.0.0:8090"
+
+server:
+  listen: "0.0.0.0:5080"
+  rtp_port_min: 10200
+  rtp_port_max: 10300
+  rtp_address: "YOUR_SERVER_IP"
+  peers:
+    - name: "telnyx"
+      hosts:
+        # Telnyx US signaling IPs
+        - "192.76.120.0/22"
+        # Add more as needed from Telnyx documentation
+      rtp_address: "YOUR_SERVER_IP"
+
+webhook:
+  url: "http://127.0.0.1:3000/webhook"
+  timeout: "5s"
+
+stream:
+  mode: "native"
+  encoding: "audio/x-l16"
+  sample_rate: 8000

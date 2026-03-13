@@ -46,7 +46,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8090:8090"
-      - "10200-10300:10200-10300/udp"
+      - "5080:5080/udp"
+      - "10200-10400:10200-10400/udp"
     volumes:
       - ./xbridge.yaml:/etc/xbridge/config.yaml:ro
     environment:
