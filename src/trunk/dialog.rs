@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -58,7 +59,7 @@ pub(crate) struct TrunkDialog {
     /// Headers from the INVITE (for `header()`/`headers()` methods).
     invite_headers: HashMap<String, Vec<String>>,
     /// CSeq counter for outgoing requests (BYE, re-INVITE, etc.).
-    cseq_counter: Mutex<u32>,
+    cseq_counter: AtomicU32,
     /// on_notify callback storage.
     on_notify_fn: Mutex<Option<Arc<dyn Fn(u16) + Send + Sync>>>,
 }
@@ -110,7 +111,7 @@ impl TrunkDialog {
             invite_cseq_num: cseq_num,
             contact_uri: Mutex::new(contact_uri),
             invite_headers: headers,
-            cseq_counter: Mutex::new(cseq_num),
+            cseq_counter: AtomicU32::new(cseq_num),
             on_notify_fn: Mutex::new(None),
         }
     }
@@ -148,7 +149,7 @@ impl TrunkDialog {
             invite_cseq_num: 1,
             contact_uri: Mutex::new(contact_uri),
             invite_headers: headers,
-            cseq_counter: Mutex::new(1),
+            cseq_counter: AtomicU32::new(1),
             on_notify_fn: Mutex::new(None),
         }
     }
@@ -251,9 +252,7 @@ impl TrunkDialog {
     }
 
     fn next_cseq(&self) -> u32 {
-        let mut counter = self.cseq_counter.lock().unwrap();
-        *counter += 1;
-        *counter
+        self.cseq_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 

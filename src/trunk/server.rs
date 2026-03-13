@@ -109,7 +109,9 @@ async fn handle_options(socket: &UdpSocket, addr: SocketAddr, msg: &SipMessage) 
     copy_dialog_headers(msg, &mut resp);
     resp.set_header("Allow", "INVITE,ACK,BYE,CANCEL,OPTIONS");
     let data = resp.to_bytes();
-    let _ = socket.send_to(&data, addr).await;
+    if let Err(e) = socket.send_to(&data, addr).await {
+        warn!("SIP send to {addr} failed: {e}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,7 +176,9 @@ async fn handle_invite(
                 &auth::build_www_authenticate(&realm, &nonce),
             );
             let data = resp.to_bytes();
-            let _ = socket.send_to(&data, addr).await;
+            if let Err(e) = socket.send_to(&data, addr).await {
+        warn!("SIP send to {addr} failed: {e}");
+    }
         }
         AuthResult::Rejected => {
             warn!("rejected INVITE from unknown source {addr}");
@@ -392,7 +396,9 @@ async fn handle_cancel(
         let (seq, _) = msg.cseq();
         resp.set_header("CSeq", &format!("{seq} INVITE"));
         let data = resp.to_bytes();
-        let _ = socket.send_to(&data, addr).await;
+        if let Err(e) = socket.send_to(&data, addr).await {
+        warn!("SIP send to {addr} failed: {e}");
+    }
     }
 }
 
@@ -617,7 +623,9 @@ async fn send_response(
     let mut resp = SipMessage::new_response(code, reason);
     copy_dialog_headers(req, &mut resp);
     let data = resp.to_bytes();
-    let _ = socket.send_to(&data, addr).await;
+    if let Err(e) = socket.send_to(&data, addr).await {
+        warn!("SIP send to {addr} failed: {e}");
+    }
 }
 
 fn copy_dialog_headers(req: &SipMessage, resp: &mut SipMessage) {
