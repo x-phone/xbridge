@@ -176,8 +176,9 @@ impl SipMessage {
     }
 
     /// Parses the CSeq header into (sequence number, method).
-    pub fn cseq(&self) -> (u32, &str) {
-        parse_cseq(self.header("CSeq"))
+    pub fn cseq(&self) -> (u32, SipMethod) {
+        let (num, method_str) = parse_cseq(self.header("CSeq"));
+        (num, SipMethod::from(method_str))
     }
 
     /// Returns the Call-ID header value.
@@ -403,7 +404,7 @@ mod tests {
         assert_eq!(msg.request_uri, "sip:1002@pbx.local");
         assert_eq!(msg.call_id(), "invite001@10.0.0.1");
         assert_eq!(msg.from_tag(), "from1");
-        assert_eq!(msg.cseq(), (1, "INVITE"));
+        assert_eq!(msg.cseq(), (1, SipMethod::Invite));
         assert_eq!(String::from_utf8_lossy(&msg.body), sdp);
     }
 
@@ -420,7 +421,7 @@ mod tests {
 
         let msg = parse(raw.as_bytes()).unwrap();
         assert_eq!(msg.method, SipMethod::Bye);
-        assert_eq!(msg.cseq(), (2, "BYE"));
+        assert_eq!(msg.cseq(), (2, SipMethod::Bye));
     }
 
     #[test]

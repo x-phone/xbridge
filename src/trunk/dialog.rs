@@ -437,7 +437,7 @@ mod tests {
         assert!(msg.header("To").contains("from1"));
         let (seq, method) = msg.cseq();
         assert_eq!(seq, 2);
-        assert_eq!(method, "BYE");
+        assert_eq!(method, SipMethod::Bye);
     }
 
     #[test]
