@@ -131,6 +131,7 @@ fn parse_digest_auth(header: &str) -> Option<DigestFields> {
 
 /// Compute SIP digest auth response (RFC 2617, MD5).
 /// response = MD5(MD5(username:realm:password):nonce:MD5(method:uri))
+#[cfg(test)]
 fn compute_digest_response(
     username: &str,
     password: &str,
@@ -144,7 +145,7 @@ fn compute_digest_response(
     md5_hex(&format!("{ha1}:{nonce}:{ha2}"))
 }
 
-fn md5_hex(input: &str) -> String {
+pub(crate) fn md5_hex(input: &str) -> String {
     format!("{:x}", md5::compute(input.as_bytes()))
 }
 
@@ -169,6 +170,7 @@ mod tests {
             listen: "0.0.0.0:5080".into(),
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
             peers: vec![
                 PeerConfig {
                     name: "office-pbx".into(),
@@ -284,6 +286,7 @@ mod tests {
             listen: "0.0.0.0:5080".into(),
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
             peers: vec![],
         };
         let msg = make_invite(None);
@@ -297,6 +300,7 @@ mod tests {
             listen: "0.0.0.0:5080".into(),
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
             peers: vec![PeerConfig {
                 name: "local".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
@@ -320,6 +324,7 @@ mod tests {
             listen: "0.0.0.0:5080".into(),
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
             peers: vec![PeerConfig {
                 name: "both-auth".into(),
                 host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),

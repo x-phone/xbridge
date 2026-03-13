@@ -23,6 +23,15 @@ use crate::state::AppState;
 use crate::webhook::WebhookEvent;
 use crate::ws::{ClientEvent, MediaFormat, ServerEvent, ServerMediaPayload, StartPayload};
 
+/// Build the WebSocket URL from the request's Host header (or config fallback).
+fn ws_url(headers: &HeaderMap, state: &AppState, call_id: &str) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(state.config.listen.http.as_str());
+    format!("ws://{host}/ws/{call_id}")
+}
+
 pub fn app(state: AppState) -> Router {
     let rate_limiter = state
         .config
@@ -282,17 +291,11 @@ async fn create_call(
     bridge::wire_call_callbacks(&call, &call_id, &state);
     bridge::wire_outbound_state_callbacks(&call, &call_id, &state);
 
-    // Build ws_url from Host header or config
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(state.config.listen.http.as_str());
-    let ws_url = format!("ws://{host}/ws/{call_id}");
-
+    let ws = ws_url(&headers, &state, &call_id);
     Ok(Json(CreateCallResponse {
         call_id,
         status: CallStatus::Dialing,
-        ws_url,
+        ws_url: ws,
     }))
 }
 
@@ -308,10 +311,7 @@ async fn create_call_to_peer(
         tracing::error!("peer '{peer_name}' requested but no trunk server configured");
         StatusCode::NOT_FOUND
     })?;
-    let peer = server_config
-        .peers
-        .iter()
-        .find(|p| p.name == peer_name)
+    let peer = crate::trunk::auth::find_peer(server_config, peer_name)
         .ok_or_else(|| {
             tracing::error!("peer '{peer_name}' not found in server config");
             StatusCode::NOT_FOUND
@@ -334,6 +334,12 @@ async fn create_call_to_peer(
     let rtp_port_min = server_config.rtp_port_min;
     let rtp_port_max = server_config.rtp_port_max;
 
+    // Use rtp_address for SIP Contact/Via when listening on 0.0.0.0.
+    let sip_addr = server_config
+        .rtp_address
+        .map(|ip| std::net::SocketAddr::new(ip, local_addr.port()))
+        .unwrap_or(local_addr);
+
     // Allocate RTP port.
     let (rtp_socket, rtp_port) =
         xphone::media::listen_rtp_port(rtp_port_min, rtp_port_max).map_err(|e| {
@@ -342,7 +348,10 @@ async fn create_call_to_peer(
         })?;
 
     // Build SDP offer.
-    let local_ip = local_addr.ip().to_string();
+    let local_ip = server_config
+        .rtp_address
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| local_addr.ip().to_string());
     let sdp_offer = xphone::sdp::build_offer(
         &local_ip,
         rtp_port as i32,
@@ -357,7 +366,7 @@ async fn create_call_to_peer(
 
     let from_header = format!(
         "<sip:{}@{}>",
-        req.from, local_addr
+        req.from, sip_addr
     );
     let to_header = format!(
         "<sip:{}@{}>",
@@ -366,7 +375,7 @@ async fn create_call_to_peer(
 
     let dialog = Arc::new(crate::trunk::dialog::TrunkDialog::new_outbound(
         sip_tx.clone(),
-        local_addr,
+        sip_addr,
         remote_addr,
         sip_call_id.clone(),
         local_tag.clone(),
@@ -425,7 +434,7 @@ async fn create_call_to_peer(
     // Send INVITE to peer.
     crate::trunk::server::build_and_send_invite(&crate::trunk::server::InviteParams {
         sip_tx: &sip_tx,
-        local_addr,
+        local_addr: sip_addr,
         remote_addr,
         sip_call_id: &sip_call_id,
         local_tag: &local_tag,
@@ -440,17 +449,11 @@ async fn create_call_to_peer(
         req.to
     );
 
-    // Build ws_url.
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(state.config.listen.http.as_str());
-    let ws_url = format!("ws://{host}/ws/{call_id}");
-
+    let ws = ws_url(headers, state, &call_id);
     Ok(Json(CreateCallResponse {
         call_id,
         status: CallStatus::Dialing,
-        ws_url,
+        ws_url: ws,
     }))
 }
 
@@ -782,8 +785,8 @@ async fn handle_ws(
         return;
     }
 
-    // Get audio channels from xphone
-    let (Some(pcm_rx), Some(pcm_tx)) = (call.pcm_reader(), call.pcm_writer()) else {
+    // Get audio channels from xphone (paced writer handles RTP timing internally)
+    let (Some(pcm_rx), Some(pcm_tx)) = (call.pcm_reader(), call.paced_pcm_writer()) else {
         tracing::error!("call {call_id}: audio channels not available");
         let _ = send_json(
             &mut ws_tx,
@@ -2010,6 +2013,7 @@ mod tests {
             peers: vec![],
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
         });
         let webhook = WebhookClient::new(&config.webhook);
         let (ended_tx, _) = tokio::sync::mpsc::channel(32);
@@ -2047,6 +2051,7 @@ mod tests {
             }],
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
         });
         let webhook = WebhookClient::new(&config.webhook);
         let (ended_tx, _) = tokio::sync::mpsc::channel(32);
@@ -2085,6 +2090,7 @@ mod tests {
             }],
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
         });
         let webhook = WebhookClient::new(&config.webhook);
         let (ended_tx, _) = tokio::sync::mpsc::channel(32);

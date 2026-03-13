@@ -15,6 +15,10 @@ pub struct ServerConfig {
     /// Maximum RTP port for media. 0 = OS-assigned.
     #[serde(default)]
     pub rtp_port_max: u16,
+    /// IP address advertised in SDP for RTP media. When the server listens on
+    /// 0.0.0.0 this must be set to the reachable IP (e.g. the container IP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtp_address: Option<IpAddr>,
 }
 
 /// A known SIP peer (PBX system) that can send/receive calls.
@@ -64,7 +68,7 @@ impl PeerAuthConfig {
     pub(crate) fn ha1(&self) -> &str {
         self.ha1_cache.get_or_init(|| {
             let input = format!("{}:xbridge:{}", self.username, self.password);
-            format!("{:x}", md5::compute(input.as_bytes()))
+            crate::trunk::auth::md5_hex(&input)
         })
     }
 }
@@ -189,6 +193,7 @@ listen: "0.0.0.0:5080"
             listen: "0.0.0.0:5080".into(),
             rtp_port_min: 0,
             rtp_port_max: 0,
+            rtp_address: None,
             peers: vec![PeerConfig {
                 name: "test".into(),
                 host: None,

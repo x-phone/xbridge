@@ -229,10 +229,16 @@ impl Default for Config {
 
 impl Config {
     /// Returns the resolved trunk list. If `trunks` is populated, use it.
-    /// Otherwise, synthesize a single trunk from the legacy `sip` block.
+    /// Otherwise, synthesize a single trunk from the legacy `sip` block
+    /// (only when actual credentials are configured).
     pub fn resolved_trunks(&self) -> Vec<TrunkConfig> {
         if !self.trunks.is_empty() {
             return self.trunks.clone();
+        }
+        // Only synthesize from the sip block if real credentials exist.
+        // In trunk-host-only mode the sip block is left at defaults.
+        if self.sip.username.is_empty() {
+            return Vec::new();
         }
         vec![TrunkConfig {
             name: "default".into(),
@@ -841,6 +847,12 @@ sample_rate = 16000
         assert_eq!(trunks[0].sip.host, "sip.a.com");
         assert_eq!(trunks[1].name, "secondary");
         assert_eq!(trunks[1].sip.host, "sip.b.com");
+    }
+
+    #[test]
+    fn resolved_trunks_empty_when_no_credentials() {
+        let config = Config::default();
+        assert!(config.resolved_trunks().is_empty());
     }
 
     #[test]

@@ -8,17 +8,120 @@ use crate::config::{Config, SipConfig};
 use crate::state::AppState;
 use crate::webhook::WebhookEvent;
 
-/// Start the SIP bridge: register with all configured trunks, handle incoming calls.
-pub async fn run(
-    config: &Config,
+/// Spawn background tasks that consume call lifecycle events (ended, DTMF, state
+/// transitions) and forward them to webhooks / clean up state.  These must run
+/// independently of SIP trunk connections so that trunk-host-mode calls are handled.
+pub fn spawn_event_consumers(
     state: AppState,
     mut ended_rx: mpsc::Receiver<(String, xphone::EndReason, std::time::Duration)>,
     mut dtmf_rx: mpsc::Receiver<(String, String)>,
     mut state_rx: mpsc::Receiver<(String, xphone::CallState)>,
+) {
+    // Call-ended cleanup task
+    let ended_state = state.clone();
+    tokio::spawn(async move {
+        while let Some((call_id, reason, duration)) = ended_rx.recv().await {
+            ended_state.calls.write().await.remove(&call_id);
+            ended_state.xphone_calls.write().await.remove(&call_id);
+            if let Ok(mut senders) = ended_state.ws_senders.write() {
+                senders.remove(&call_id);
+            }
+            if let Some(handle) = ended_state.plays.write().await.remove(&call_id) {
+                handle
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                handle.task.abort();
+            }
+            if call_id.starts_with("trunk-") {
+                let mut dialogs = ended_state.trunk_dialogs.write().await;
+                dialogs.retain(|_, entry| entry.xbridge_call_id.as_deref() != Some(&call_id));
+            }
+
+            let reason_str = end_reason_str(reason);
+
+            let webhook = ended_state.webhook.clone();
+            tokio::spawn(async move {
+                webhook
+                    .send_event(&WebhookEvent::Ended {
+                        call_id,
+                        reason: reason_str.to_string(),
+                        duration: duration.as_secs(),
+                    })
+                    .await;
+            });
+        }
+    });
+
+    // DTMF webhook delivery task
+    let dtmf_state = state.clone();
+    tokio::spawn(async move {
+        while let Some((call_id, digit)) = dtmf_rx.recv().await {
+            dtmf_state
+                .webhook
+                .send_event(&WebhookEvent::Dtmf { call_id, digit })
+                .await;
+        }
+    });
+
+    // Outbound call-state transition task
+    let state_state = state.clone();
+    tokio::spawn(async move {
+        while let Some((call_id, new_state)) = state_rx.recv().await {
+            match new_state {
+                xphone::CallState::RemoteRinging => {
+                    let (from, to) = {
+                        let mut calls = state_state.calls.write().await;
+                        if let Some(info) = calls.get_mut(&call_id) {
+                            info.status = CallStatus::Ringing;
+                            (info.from.clone(), info.to.clone())
+                        } else {
+                            continue;
+                        }
+                    };
+                    state_state
+                        .webhook
+                        .send_event(&WebhookEvent::Ringing { call_id, from, to })
+                        .await;
+                }
+                xphone::CallState::Active => {
+                    let should_notify = {
+                        let mut calls = state_state.calls.write().await;
+                        if let Some(info) = calls.get_mut(&call_id) {
+                            if info.status == CallStatus::Dialing
+                                || info.status == CallStatus::Ringing
+                            {
+                                info.status = CallStatus::InProgress;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if should_notify {
+                        state_state
+                            .webhook
+                            .send_event(&WebhookEvent::Answered { call_id })
+                            .await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// Start the SIP bridge: register with all configured trunks, handle incoming calls.
+/// Returns `Ok(())` immediately when no trunks are configured (trunk-host-only mode).
+pub async fn run(
+    config: &Config,
+    state: AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let trunks = config.resolved_trunks();
     if trunks.is_empty() {
-        return Err("no SIP trunks configured".into());
+        tracing::info!("no SIP trunks configured, skipping trunk client");
+        return Ok(());
     }
 
     // Channel for incoming calls (shared across all trunks)
@@ -70,106 +173,6 @@ pub async fn run(
 
     // Drop our copy so the channel closes when all phones drop theirs
     drop(incoming_tx);
-
-    // Spawn call-ended cleanup task
-    let ended_state = state.clone();
-    tokio::spawn(async move {
-        while let Some((call_id, reason, duration)) = ended_rx.recv().await {
-            // Remove from all registries first, then send webhook without blocking the consumer
-            ended_state.calls.write().await.remove(&call_id);
-            ended_state.xphone_calls.write().await.remove(&call_id);
-            if let Ok(mut senders) = ended_state.ws_senders.write() {
-                senders.remove(&call_id);
-            }
-            // Cancel any active playback for this call
-            if let Some(handle) = ended_state.plays.write().await.remove(&call_id) {
-                handle
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                handle.task.abort();
-            }
-            // Remove trunk dialog entry (for trunk host calls ending via local hangup).
-            if call_id.starts_with("trunk-") {
-                let mut dialogs = ended_state.trunk_dialogs.write().await;
-                dialogs.retain(|_, entry| entry.xbridge_call_id.as_deref() != Some(&call_id));
-            }
-
-            let reason_str = end_reason_str(reason);
-
-            // Spawn webhook delivery so the consumer can process the next event immediately
-            let webhook = ended_state.webhook.clone();
-            tokio::spawn(async move {
-                webhook
-                    .send_event(&WebhookEvent::Ended {
-                        call_id,
-                        reason: reason_str.to_string(),
-                        duration: duration.as_secs(),
-                    })
-                    .await;
-            });
-        }
-    });
-
-    // Spawn DTMF webhook delivery task
-    let dtmf_state = state.clone();
-    tokio::spawn(async move {
-        while let Some((call_id, digit)) = dtmf_rx.recv().await {
-            dtmf_state
-                .webhook
-                .send_event(&WebhookEvent::Dtmf { call_id, digit })
-                .await;
-        }
-    });
-
-    // Spawn outbound call-state transition task
-    let state_state = state.clone();
-    tokio::spawn(async move {
-        while let Some((call_id, new_state)) = state_rx.recv().await {
-            match new_state {
-                xphone::CallState::RemoteRinging => {
-                    let (from, to) = {
-                        let mut calls = state_state.calls.write().await;
-                        if let Some(info) = calls.get_mut(&call_id) {
-                            info.status = CallStatus::Ringing;
-                            (info.from.clone(), info.to.clone())
-                        } else {
-                            continue;
-                        }
-                    };
-                    state_state
-                        .webhook
-                        .send_event(&WebhookEvent::Ringing { call_id, from, to })
-                        .await;
-                }
-                xphone::CallState::Active => {
-                    // Only send Answered on the initial answer (Dialing/Ringing → Active).
-                    // Resume from hold triggers Active too, but REST handler sends Resumed.
-                    let should_notify = {
-                        let mut calls = state_state.calls.write().await;
-                        if let Some(info) = calls.get_mut(&call_id) {
-                            if info.status == CallStatus::Dialing
-                                || info.status == CallStatus::Ringing
-                            {
-                                info.status = CallStatus::InProgress;
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    };
-                    if should_notify {
-                        state_state
-                            .webhook
-                            .send_event(&WebhookEvent::Answered { call_id })
-                            .await;
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
 
     // Handle incoming calls
     while let Some(call) = incoming_rx.recv().await {

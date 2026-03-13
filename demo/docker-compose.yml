@@ -1,20 +1,78 @@
 services:
+  asterisk:
+    image: andrius/asterisk:latest
+    entrypoint: ["/scripts/entrypoint.sh", "-f"]
+    tty: true
+    stdin_open: true
+    user: "0"   # Root needed to create /data/sounds on shared volume
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-10099:10000-10099/udp"
+    volumes:
+      # Base Asterisk config from xpbx
+      - ../../xpbx/asterisk/config:/etc/asterisk
+      - ../../xpbx/asterisk/scripts/entrypoint.sh:/scripts/entrypoint.sh:ro
+      # Demo overrides (voiceworker → xbridge, extension 1001, route 2000)
+      - ./xpbx-overrides/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./xpbx-overrides/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./xpbx-overrides/sorcery.conf:/etc/asterisk/sorcery.conf:ro
+      - demo-data:/data
+    environment:
+      - EXTERNAL_IP=${EXTERNAL_IP:-}
+    networks:
+      demo:
+        ipv4_address: 10.200.0.10
+
+  xpbx:
+    build: ../../xpbx/server
+    environment:
+      - XPBX_LISTEN_ADDR=:8080
+      - XPBX_DB_PATH=/data/asterisk-realtime.db
+      - ARI_HOST=asterisk
+      - ARI_PORT=8088
+      - ARI_USER=xpbx
+      - ARI_PASSWORD=secret
+    ports:
+      - "8080:8080"
+    volumes:
+      - demo-data:/data
+    depends_on: [asterisk]
+    networks: [demo]
+
   xbridge:
     build:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
+      - "8090:8090"
       - "10200-10300:10200-10300/udp"
     volumes:
-      - ./config.yaml:/etc/xbridge/config.yaml:ro
+      - ./xbridge.yaml:/etc/xbridge/config.yaml:ro
     environment:
       - RUST_LOG=info
-    depends_on:
-      - echo-bot
+    depends_on: [asterisk]
+    networks:
+      demo:
+        ipv4_address: 10.200.0.20
 
-  echo-bot:
-    build: .
+  voice-app:
+    build: ./voice-app
+    ports:
+      - "3000:3000"
     environment:
-      - XBRIDGE_HOST=xbridge:8080
-      - DEMO_PORT=3000
+      - XBRIDGE_HOST=10.200.0.20:8090
+    depends_on: [xbridge]
+    networks:
+      demo:
+        ipv4_address: 10.200.0.30
+
+volumes:
+  demo-data:
+
+networks:
+  demo:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.200.0.0/24

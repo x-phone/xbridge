@@ -27,13 +27,14 @@ async fn main() {
 
     let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx, state_tx);
 
+    // Spawn call lifecycle consumers (must run before bridge/trunk so events are never lost)
+    xbridge::bridge::spawn_event_consumers(state.clone(), ended_rx, dtmf_rx, state_rx);
+
     // Start SIP bridge in background (trunk client — registers with providers)
     let bridge_state = state.clone();
     let bridge_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            xbridge::bridge::run(&bridge_config, bridge_state, ended_rx, dtmf_rx, state_rx).await
-        {
+        if let Err(e) = xbridge::bridge::run(&bridge_config, bridge_state).await {
             tracing::error!("SIP bridge error: {e}");
         }
     });

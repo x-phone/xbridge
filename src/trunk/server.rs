@@ -151,6 +151,7 @@ async fn handle_invite(
             let sip_tx = sip_tx.clone();
             let rtp_port_min = config.rtp_port_min;
             let rtp_port_max = config.rtp_port_max;
+            let rtp_address = config.rtp_address;
             tokio::spawn(async move {
                 handle_trunk_incoming(
                     &msg,
@@ -163,6 +164,7 @@ async fn handle_invite(
                     addr,
                     rtp_port_min,
                     rtp_port_max,
+                    rtp_address,
                 )
                 .await;
             });
@@ -177,8 +179,8 @@ async fn handle_invite(
             );
             let data = resp.to_bytes();
             if let Err(e) = socket.send_to(&data, addr).await {
-        warn!("SIP send to {addr} failed: {e}");
-    }
+                warn!("SIP send to {addr} failed: {e}");
+            }
         }
         AuthResult::Rejected => {
             warn!("rejected INVITE from unknown source {addr}");
@@ -202,6 +204,7 @@ async fn handle_trunk_incoming(
     remote_addr: SocketAddr,
     rtp_port_min: u16,
     rtp_port_max: u16,
+    rtp_address: Option<std::net::IpAddr>,
 ) {
     let call_id = format!("trunk-{}", uuid_v4());
     let from = invite.from_user().to_string();
@@ -210,6 +213,13 @@ async fn handle_trunk_incoming(
     info!(
         "trunk incoming call {call_id} from peer '{peer_name}': {from} → {to}"
     );
+
+    // Use rtp_address for SIP Contact/Via when the server listens on 0.0.0.0,
+    // otherwise peers can't route BYE back to us.
+    let sip_addr = match rtp_address {
+        Some(ip) => SocketAddr::new(ip, local_addr.port()),
+        None => local_addr,
+    };
 
     // ── Webhook dispatch ──
 
@@ -255,7 +265,7 @@ async fn handle_trunk_incoming(
             let local_tag = generate_tag();
             let dialog = Arc::new(TrunkDialog::new(
                 sip_tx,
-                local_addr,
+                sip_addr,
                 remote_addr,
                 invite,
                 local_tag,
@@ -263,7 +273,9 @@ async fn handle_trunk_incoming(
 
             let call = xphone::Call::new_inbound(dialog);
 
-            let local_ip = local_addr.ip().to_string();
+            let local_ip = rtp_address
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| local_addr.ip().to_string());
 
             call.set_local_media(&local_ip, rtp_port as i32);
             call.set_rtp_socket(rtp_socket);
@@ -397,8 +409,8 @@ async fn handle_cancel(
         resp.set_header("CSeq", &format!("{seq} INVITE"));
         let data = resp.to_bytes();
         if let Err(e) = socket.send_to(&data, addr).await {
-        warn!("SIP send to {addr} failed: {e}");
-    }
+            warn!("SIP send to {addr} failed: {e}");
+        }
     }
 }
 
@@ -462,7 +474,7 @@ async fn handle_response(
     debug!("SIP response {code} for Call-ID={sip_call_id} (CSeq method={cseq_method})");
 
     // Only handle responses to INVITE (ignore BYE/CANCEL responses).
-    if cseq_method != SipMethod::Invite.as_str() {
+    if cseq_method != SipMethod::Invite {
         return;
     }
 
