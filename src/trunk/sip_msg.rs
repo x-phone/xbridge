@@ -3,13 +3,66 @@
 //! Handles only the subset needed for a UAS: INVITE, ACK, BYE, CANCEL, OPTIONS.
 //! Intentionally independent from xphone's internal SIP parser.
 
+use std::fmt;
 use std::fmt::Write;
+
+/// Known SIP methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SipMethod {
+    Invite,
+    Ack,
+    Bye,
+    Cancel,
+    Options,
+    Info,
+    Refer,
+    Register,
+    Other(String),
+}
+
+impl SipMethod {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Invite => "INVITE",
+            Self::Ack => "ACK",
+            Self::Bye => "BYE",
+            Self::Cancel => "CANCEL",
+            Self::Options => "OPTIONS",
+            Self::Info => "INFO",
+            Self::Refer => "REFER",
+            Self::Register => "REGISTER",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl fmt::Display for SipMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for SipMethod {
+    fn from(s: &str) -> Self {
+        match s {
+            "INVITE" => Self::Invite,
+            "ACK" => Self::Ack,
+            "BYE" => Self::Bye,
+            "CANCEL" => Self::Cancel,
+            "OPTIONS" => Self::Options,
+            "INFO" => Self::Info,
+            "REFER" => Self::Refer,
+            "REGISTER" => Self::Register,
+            _ => Self::Other(s.to_string()),
+        }
+    }
+}
 
 /// A parsed SIP message (request or response).
 #[derive(Debug, Clone)]
 pub struct SipMessage {
-    /// Request method (INVITE, BYE, etc.). Empty for responses.
-    pub method: String,
+    /// Request method (INVITE, BYE, etc.). Empty string for responses.
+    pub method: SipMethod,
     /// Request-URI. Empty for responses.
     pub request_uri: String,
     /// Status code. 0 for requests.
@@ -45,9 +98,9 @@ impl std::error::Error for ParseError {}
 
 impl SipMessage {
     /// Create a new SIP request.
-    pub fn new_request(method: &str, request_uri: &str) -> Self {
+    pub fn new_request(method: SipMethod, request_uri: &str) -> Self {
         Self {
-            method: method.into(),
+            method,
             request_uri: request_uri.into(),
             status_code: 0,
             reason: String::new(),
@@ -59,7 +112,7 @@ impl SipMessage {
     /// Create a new SIP response.
     pub fn new_response(status_code: u16, reason: &str) -> Self {
         Self {
-            method: String::new(),
+            method: SipMethod::Other(String::new()),
             request_uri: String::new(),
             status_code,
             reason: reason.into(),
@@ -167,7 +220,7 @@ impl SipMessage {
         if self.is_response() {
             let _ = write!(buf, "SIP/2.0 {} {}\r\n", self.status_code, self.reason);
         } else {
-            let _ = write!(buf, "{} {} SIP/2.0\r\n", self.method, self.request_uri);
+            let _ = write!(buf, "{} {} SIP/2.0\r\n", self.method.as_str(), self.request_uri);
         }
 
         for (name, value) in &self.headers {
@@ -212,7 +265,7 @@ pub fn parse(data: &[u8]) -> Result<SipMessage, ParseError> {
     }
 
     let mut msg = SipMessage {
-        method: String::new(),
+        method: SipMethod::Other(String::new()),
         request_uri: String::new(),
         status_code: 0,
         reason: String::new(),
@@ -229,7 +282,7 @@ pub fn parse(data: &[u8]) -> Result<SipMessage, ParseError> {
         if parts.len() < 3 || parts[2] != "SIP/2.0" {
             return Err(ParseError::MalformedStartLine);
         }
-        msg.method = parts[0].into();
+        msg.method = SipMethod::from(parts[0]);
         msg.request_uri = parts[1].into();
     }
 
@@ -346,7 +399,7 @@ mod tests {
 
         let msg = parse(raw.as_bytes()).unwrap();
         assert!(!msg.is_response());
-        assert_eq!(msg.method, "INVITE");
+        assert_eq!(msg.method, SipMethod::Invite);
         assert_eq!(msg.request_uri, "sip:1002@pbx.local");
         assert_eq!(msg.call_id(), "invite001@10.0.0.1");
         assert_eq!(msg.from_tag(), "from1");
@@ -366,7 +419,7 @@ mod tests {
                    \r\n";
 
         let msg = parse(raw.as_bytes()).unwrap();
-        assert_eq!(msg.method, "BYE");
+        assert_eq!(msg.method, SipMethod::Bye);
         assert_eq!(msg.cseq(), (2, "BYE"));
     }
 
@@ -382,7 +435,7 @@ mod tests {
                    \r\n";
 
         let msg = parse(raw.as_bytes()).unwrap();
-        assert_eq!(msg.method, "CANCEL");
+        assert_eq!(msg.method, SipMethod::Cancel);
     }
 
     #[test]
@@ -397,7 +450,7 @@ mod tests {
                    \r\n";
 
         let msg = parse(raw.as_bytes()).unwrap();
-        assert_eq!(msg.method, "OPTIONS");
+        assert_eq!(msg.method, SipMethod::Options);
     }
 
     #[test]
@@ -412,7 +465,7 @@ mod tests {
                    \r\n";
 
         let msg = parse(raw.as_bytes()).unwrap();
-        assert_eq!(msg.method, "ACK");
+        assert_eq!(msg.method, SipMethod::Ack);
     }
 
     #[test]
@@ -563,7 +616,7 @@ mod tests {
     #[test]
     fn build_request_with_body() {
         let sdp = "v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\ns=-\r\n";
-        let mut msg = SipMessage::new_request("INVITE", "sip:1002@pbx.local");
+        let mut msg = SipMessage::new_request(SipMethod::Invite, "sip:1002@pbx.local");
         msg.set_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK111");
         msg.set_header("From", "<sip:1001@pbx.local>;tag=f1");
         msg.set_header("To", "<sip:1002@pbx.local>");
@@ -574,14 +627,14 @@ mod tests {
 
         let bytes = msg.to_bytes();
         let parsed = parse(&bytes).unwrap();
-        assert_eq!(parsed.method, "INVITE");
+        assert_eq!(parsed.method, SipMethod::Invite);
         assert_eq!(String::from_utf8_lossy(&parsed.body), sdp);
         assert_eq!(parsed.header("Content-Length"), sdp.len().to_string());
     }
 
     #[test]
     fn set_header_replaces() {
-        let mut msg = SipMessage::new_request("REGISTER", "sip:pbx.local");
+        let mut msg = SipMessage::new_request(SipMethod::Register, "sip:pbx.local");
         msg.set_header("Call-ID", "first");
         msg.set_header("Call-ID", "second");
         assert_eq!(msg.header("Call-ID"), "second");

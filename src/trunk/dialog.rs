@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use crate::trunk::sip_msg::{self, SipMessage};
+use crate::trunk::sip_msg::{self, SipMessage, SipMethod};
 use crate::trunk::util::generate_branch;
 
 /// An outgoing SIP datagram to be sent by the server's send task.
@@ -200,12 +200,12 @@ impl TrunkDialog {
     }
 
     /// Build and enqueue a SIP request (BYE, re-INVITE, REFER, INFO).
-    pub(crate) fn send_sip_request(&self, method: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> xphone::Result<()> {
+    pub(crate) fn send_sip_request(&self, method: SipMethod, body: &[u8], extra_headers: &[(&str, &str)]) -> xphone::Result<()> {
         let branch = generate_branch();
         let cseq = self.next_cseq();
         let contact_uri = self.contact_uri.lock().unwrap().clone();
 
-        let mut req = SipMessage::new_request(method, &contact_uri);
+        let mut req = SipMessage::new_request(method.clone(), &contact_uri);
         req.set_header(
             "Via",
             &format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch),
@@ -218,7 +218,7 @@ impl TrunkDialog {
         req.set_header("To", &append_tag(&self.remote_to, &remote_tag));
 
         req.set_header("Call-ID", &self.sip_call_id);
-        req.set_header("CSeq", &format!("{} {}", cseq, method));
+        req.set_header("CSeq", &format!("{} {}", cseq, method.as_str()));
         req.set_header(
             "Contact",
             &format!("<sip:xbridge@{}>", self.local_addr),
@@ -262,32 +262,32 @@ impl xphone::dialog::Dialog for TrunkDialog {
     }
 
     fn send_bye(&self) -> xphone::Result<()> {
-        self.send_sip_request("BYE", &[], &[])
+        self.send_sip_request(SipMethod::Bye, &[], &[])
     }
 
     fn send_cancel(&self) -> xphone::Result<()> {
         if self.role == DialogRole::Uas {
             return Err(xphone::Error::InvalidState);
         }
-        self.send_sip_request("CANCEL", &[], &[])
+        self.send_sip_request(SipMethod::Cancel, &[], &[])
     }
 
     fn send_reinvite(&self, sdp: &[u8]) -> xphone::Result<()> {
         self.send_sip_request(
-            "INVITE",
+            SipMethod::Invite,
             sdp,
             &[("Content-Type", "application/sdp")],
         )
     }
 
     fn send_refer(&self, target: &str) -> xphone::Result<()> {
-        self.send_sip_request("REFER", &[], &[("Refer-To", target)])
+        self.send_sip_request(SipMethod::Refer, &[], &[("Refer-To", target)])
     }
 
     fn send_info_dtmf(&self, digit: &str, duration_ms: u32) -> xphone::Result<()> {
         let body = format!("Signal={}\r\nDuration={}\r\n", digit, duration_ms);
         self.send_sip_request(
-            "INFO",
+            SipMethod::Info,
             body.as_bytes(),
             &[("Content-Type", "application/dtmf-relay")],
         )
@@ -355,7 +355,7 @@ mod tests {
     use xphone::dialog::Dialog;
 
     fn sample_invite() -> SipMessage {
-        let mut msg = SipMessage::new_request("INVITE", "sip:1002@xbridge:5080");
+        let mut msg = SipMessage::new_request(SipMethod::Invite, "sip:1002@xbridge:5080");
         msg.add_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK111");
         msg.set_header("From", "<sip:1001@pbx.local>;tag=from1");
         msg.set_header("To", "<sip:1002@xbridge:5080>");
@@ -429,7 +429,7 @@ mod tests {
         let msg = sip_msg::parse(&outgoing.data).unwrap();
 
         assert!(!msg.is_response());
-        assert_eq!(msg.method, "BYE");
+        assert_eq!(msg.method, SipMethod::Bye);
         assert_eq!(msg.request_uri, "sip:1001@10.0.0.1:5060");
         assert_eq!(msg.header("Call-ID"), "testcall@host");
         // In UAS dialog, From/To are swapped for outgoing requests.
@@ -454,7 +454,7 @@ mod tests {
 
         let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
 
-        assert_eq!(msg.method, "INVITE");
+        assert_eq!(msg.method, SipMethod::Invite);
         assert_eq!(msg.header("Content-Type"), "application/sdp");
         assert_eq!(msg.body, sdp);
     }
@@ -466,7 +466,7 @@ mod tests {
 
         let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
 
-        assert_eq!(msg.method, "REFER");
+        assert_eq!(msg.method, SipMethod::Refer);
         assert_eq!(msg.header("Refer-To"), "sip:1003@pbx.local");
     }
 
@@ -477,7 +477,7 @@ mod tests {
 
         let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
 
-        assert_eq!(msg.method, "INFO");
+        assert_eq!(msg.method, SipMethod::Info);
         assert_eq!(msg.header("Content-Type"), "application/dtmf-relay");
         let body = String::from_utf8_lossy(&msg.body);
         assert!(body.contains("Signal=5"));
@@ -489,7 +489,7 @@ mod tests {
         let (dialog, mut rx) = make_dialog();
         dialog.send_bye().unwrap();
         // BYE would end the dialog, but for testing CSeq we just send again.
-        let _ = dialog.send_sip_request("INFO", &[], &[]);
+        let _ = dialog.send_sip_request(SipMethod::Info, &[], &[]);
 
         let msg1 = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
         let msg2 = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
@@ -600,7 +600,7 @@ mod tests {
         dialog.send_bye().unwrap();
 
         let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
-        assert_eq!(msg.method, "BYE");
+        assert_eq!(msg.method, SipMethod::Bye);
         assert_eq!(msg.header("Call-ID"), "outbound-call-id@xbridge");
         // UAC: From is our local party (with our tag).
         assert!(msg.header("From").contains("1001@127.0.0.1:5080"));
@@ -615,7 +615,7 @@ mod tests {
         dialog.send_cancel().unwrap();
 
         let msg = sip_msg::parse(&rx.try_recv().unwrap().data).unwrap();
-        assert_eq!(msg.method, "CANCEL");
+        assert_eq!(msg.method, SipMethod::Cancel);
         assert_eq!(msg.header("Call-ID"), "outbound-call-id@xbridge");
     }
 

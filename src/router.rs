@@ -423,16 +423,16 @@ async fn create_call_to_peer(
     bridge::wire_outbound_state_callbacks(&call, &call_id, state);
 
     // Send INVITE to peer.
-    crate::trunk::server::build_and_send_invite(
-        &sip_tx,
+    crate::trunk::server::build_and_send_invite(&crate::trunk::server::InviteParams {
+        sip_tx: &sip_tx,
         local_addr,
         remote_addr,
-        &sip_call_id,
-        &local_tag,
-        &req.from,
-        &req.to,
-        &sdp_offer,
-    );
+        sip_call_id: &sip_call_id,
+        local_tag: &local_tag,
+        from: &req.from,
+        to: &req.to,
+        sdp: &sdp_offer,
+    });
 
     tracing::info!(
         "outbound call {call_id} to peer '{peer_name}' at {remote_addr}: {} → {}",

@@ -53,7 +53,7 @@ pub fn authenticate(
                     if cred.username == digest.username {
                         // Use pre-computed HA1 (cached on first access).
                         let ha1 = cred.ha1();
-                        let ha2 = md5_hex(&format!("{}:{}", &msg.method, &digest.uri));
+                        let ha2 = md5_hex(&format!("{}:{}", msg.method.as_str(), &digest.uri));
                         let expected = md5_hex(&format!("{ha1}:{}:{ha2}", &digest.nonce));
                         if expected == digest.response {
                             return AuthResult::Authenticated(peer.name.clone());
@@ -189,7 +189,7 @@ mod tests {
     }
 
     fn make_invite(auth_header: Option<&str>) -> SipMessage {
-        let mut msg = SipMessage::new_request("INVITE", "sip:1002@xbridge:5080");
+        let mut msg = SipMessage::new_request(crate::trunk::sip_msg::SipMethod::Invite, "sip:1002@xbridge:5080");
         msg.set_header("From", "<sip:1001@pbx.local>;tag=abc");
         msg.set_header("To", "<sip:1002@xbridge:5080>");
         msg.set_header("Call-ID", "test@host");
