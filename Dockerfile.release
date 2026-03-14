@@ -1,20 +1,12 @@
-# ── Build stage ──
-FROM rust:1.87-bookworm AS builder
-
-WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-
-RUN cargo build --release
-
-# ── Runtime stage ──
 FROM debian:bookworm-slim
+
+ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/xbridge /usr/local/bin/xbridge
+COPY docker-bin/linux-${TARGETARCH}/xbridge /usr/local/bin/xbridge
 
 EXPOSE 8080
 EXPOSE 10000-20000/udp
