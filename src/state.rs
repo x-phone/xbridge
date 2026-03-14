@@ -39,6 +39,8 @@ pub struct AppState {
     pub(crate) ws_senders: WsSenderRegistry,
     pub(crate) plays: PlayRegistry,
     pub(crate) play_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Trunk host server handle (set when trunk host server starts).
+    pub(crate) xphone_server: Arc<RwLock<Option<xphone::Server>>>,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
         ended_tx: mpsc::Sender<(String, xphone::EndReason, std::time::Duration)>,
         dtmf_tx: mpsc::Sender<(String, String)>,
         state_tx: mpsc::Sender<(String, xphone::CallState)>,
+        metrics: Metrics,
     ) -> Self {
         Self {
             calls: Arc::new(RwLock::new(HashMap::new())),
@@ -58,10 +61,11 @@ impl AppState {
             state_tx,
             webhook,
             config: Arc::new(config),
-            metrics: Metrics::new(),
+            metrics,
             ws_senders: Arc::new(std::sync::RwLock::new(HashMap::new())),
             plays: Arc::new(RwLock::new(HashMap::new())),
             play_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            xphone_server: Arc::new(RwLock::new(None)),
         }
     }
 }

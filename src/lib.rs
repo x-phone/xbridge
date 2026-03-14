@@ -7,6 +7,7 @@ pub mod config;
 pub mod metrics;
 pub mod router;
 pub mod state;
+pub mod trunk;
 pub mod wav;
 pub mod webhook;
 pub mod webhook_client;

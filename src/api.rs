@@ -14,6 +14,10 @@ pub struct CreateCallRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trunk: Option<String>,
+    /// Target peer name for outbound calls via trunk host server.
+    /// Mutually exclusive with `trunk`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,6 +56,9 @@ pub struct IncomingCallWebhook {
     pub from: String,
     pub to: String,
     pub direction: CallDirection,
+    /// Name of the trunk host peer, if this call came from a peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
 }
 
 // ── Incoming call response (your app → xbridge) ──
@@ -108,6 +115,7 @@ mod tests {
             webhook_url: Some("https://app.com/events".into()),
             stream: Some(true),
             trunk: Some("primary".into()),
+            peer: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["to"], "+15551234567");
@@ -136,6 +144,7 @@ mod tests {
             webhook_url: None,
             stream: None,
             trunk: None,
+            peer: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("webhook_url").is_none());
@@ -179,6 +188,7 @@ mod tests {
                 to: "+15559876543".into(),
                 direction: CallDirection::Inbound,
                 status: CallStatus::InProgress,
+                peer: None,
             }],
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -221,6 +231,7 @@ mod tests {
             from: "+15551234567".into(),
             to: "+15559876543".into(),
             direction: CallDirection::Inbound,
+            peer: None,
         };
         let json = serde_json::to_value(&hook).unwrap();
         assert_eq!(json["call_id"], "abc123");

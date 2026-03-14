@@ -2120,9 +2120,9 @@ dependencies = [
 
 [[package]]
 name = "xphone"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3464380da1b4efce3054bf5c10665ed762ca85c3b06c7f879262d7debb83a2d"
+checksum = "c5455107b5517d3a062f0057766745ed17417fe1fa8cd339029e4a9447cf43cc"
 dependencies = [
  "aes",
  "bytes",

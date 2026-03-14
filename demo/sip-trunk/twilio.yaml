@@ -1,0 +1,49 @@
+# xbridge config — Twilio SIP Trunk
+#
+# Accept inbound PSTN calls from a Twilio SIP Trunk.
+# No PBX needed — xbridge connects Twilio directly to your voice app.
+#
+# Setup:
+#   1. Create a Twilio SIP Trunk: https://console.twilio.com/us1/develop/sip-trunking
+#   2. Set the Origination URI to: sip:YOUR_SERVER_IP:5080;transport=udp
+#   3. Buy a phone number and assign it to the trunk
+#   4. Open firewall ports: 5080/udp (SIP), 10200-10300/udp (RTP)
+#   5. Replace YOUR_SERVER_IP below with your server's public IP
+#   6. Copy this file: cp twilio.yaml xbridge.yaml
+#   7. Run: docker compose up --build
+#
+# Twilio signaling IPs:
+#   https://www.twilio.com/docs/sip-trunking/ip-addresses
+
+listen:
+  http: "0.0.0.0:8090"
+
+server:
+  listen: "0.0.0.0:5080"
+  rtp_port_min: 10200
+  rtp_port_max: 10300
+  rtp_address: "YOUR_SERVER_IP"
+  peers:
+    - name: "twilio"
+      hosts:
+        # North America Virginia + Oregon
+        - "54.172.60.0/30"
+        - "54.244.51.0/30"
+        # Europe Ireland + Frankfurt
+        - "54.171.127.192/30"
+        - "35.156.191.128/30"
+        # Asia Pacific Tokyo + Singapore + Sydney
+        - "54.65.63.192/30"
+        - "54.169.127.128/30"
+        - "54.252.254.64/30"
+        # South America São Paulo
+        - "177.71.206.192/30"
+      rtp_address: "YOUR_SERVER_IP"
+
+webhook:
+  url: "http://voice-app:3000/webhook"
+  timeout: "5s"
+
+stream:
+  encoding: "audio/x-l16"
+  sample_rate: 8000

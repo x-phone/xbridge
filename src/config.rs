@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 
+use crate::trunk::config::ServerConfig;
+
 // ── Error ──
 
 #[derive(Debug)]
@@ -57,6 +59,9 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Optional SIP trunk host server configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,23 +148,17 @@ fn default_retry() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StreamConfig {
-    #[serde(default = "default_stream_mode")]
-    pub mode: StreamMode,
     #[serde(default = "default_encoding")]
     pub encoding: AudioEncoding,
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamMode {
     Twilio,
     Native,
-}
-
-fn default_stream_mode() -> StreamMode {
-    StreamMode::Twilio
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -217,16 +216,23 @@ impl Default for Config {
             auth: AuthConfig::default(),
             tls: TlsConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            server: None,
         }
     }
 }
 
 impl Config {
     /// Returns the resolved trunk list. If `trunks` is populated, use it.
-    /// Otherwise, synthesize a single trunk from the legacy `sip` block.
+    /// Otherwise, synthesize a single trunk from the legacy `sip` block
+    /// (only when actual credentials are configured).
     pub fn resolved_trunks(&self) -> Vec<TrunkConfig> {
         if !self.trunks.is_empty() {
             return self.trunks.clone();
+        }
+        // Only synthesize from the sip block if real credentials exist.
+        // In trunk-host-only mode the sip block is left at defaults.
+        if self.sip.username.is_empty() {
+            return Vec::new();
         }
         vec![TrunkConfig {
             name: "default".into(),
@@ -238,7 +244,6 @@ impl Config {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
-            mode: default_stream_mode(),
             encoding: AudioEncoding::Mulaw,
             sample_rate: default_sample_rate(),
         }
@@ -344,13 +349,6 @@ impl Config {
         }
 
         // Stream
-        if let Ok(v) = get_var("XBRIDGE_STREAM_MODE") {
-            match v.as_str() {
-                "twilio" => config.stream.mode = StreamMode::Twilio,
-                "native" => config.stream.mode = StreamMode::Native,
-                _ => {}
-            }
-        }
         if let Ok(v) = get_var("XBRIDGE_STREAM_ENCODING") {
             match v.as_str() {
                 "audio/x-mulaw" => config.stream.encoding = AudioEncoding::Mulaw,
@@ -413,7 +411,6 @@ mod tests {
                 "retry": 1
             },
             "stream": {
-                "mode": "twilio",
                 "encoding": "audio/x-mulaw",
                 "sample_rate": 8000
             }
@@ -435,7 +432,7 @@ mod tests {
             Some("stun.l.google.com:19302")
         );
         assert_eq!(config.webhook.url, "https://your-app.com/events");
-        assert_eq!(config.stream.mode, StreamMode::Twilio);
+
         assert_eq!(config.stream.encoding, AudioEncoding::Mulaw);
         assert_eq!(config.stream.sample_rate, 8000);
 
@@ -466,7 +463,7 @@ mod tests {
         assert!(config.sip.stun_server.is_none());
         assert_eq!(config.webhook.timeout, "5s");
         assert_eq!(config.webhook.retry, 1);
-        assert_eq!(config.stream.mode, StreamMode::Twilio);
+
         assert_eq!(config.stream.encoding, AudioEncoding::Mulaw);
         assert_eq!(config.stream.sample_rate, 8000);
     }
@@ -527,7 +524,6 @@ webhook:
   retry: 3
 
 stream:
-  mode: "native"
   encoding: "audio/x-l16"
   sample_rate: 16000
 "#;
@@ -556,7 +552,7 @@ webhook:
         assert!(config.sip.srtp);
         assert_eq!(config.webhook.timeout, "10s");
         assert_eq!(config.webhook.retry, 3);
-        assert_eq!(config.stream.mode, StreamMode::Native);
+
         assert_eq!(config.stream.encoding, AudioEncoding::L16);
         assert_eq!(config.stream.sample_rate, 16000);
     }
@@ -568,7 +564,7 @@ webhook:
         assert_eq!(config.sip.rtp_port_min, 0);
         assert!(!config.sip.srtp);
         assert_eq!(config.webhook.timeout, "5s");
-        assert_eq!(config.stream.mode, StreamMode::Twilio);
+
         assert_eq!(config.stream.encoding, AudioEncoding::Mulaw);
     }
 
@@ -599,7 +595,6 @@ timeout = "10s"
 retry = 3
 
 [stream]
-mode = "native"
 encoding = "audio/x-l16"
 sample_rate = 16000
 "#;
@@ -610,7 +605,7 @@ sample_rate = 16000
         assert_eq!(config.listen.http, "0.0.0.0:9090");
         assert_eq!(config.sip.transport, SipTransport::Tls);
         assert_eq!(config.sip.rtp_port_min, 16000);
-        assert_eq!(config.stream.mode, StreamMode::Native);
+
         assert_eq!(config.stream.encoding, AudioEncoding::L16);
     }
 
@@ -722,13 +717,12 @@ sample_rate = 16000
         let mut config = Config::default();
         let env = make_env(&[
             ("XBRIDGE_SIP_TRANSPORT", "tls"),
-            ("XBRIDGE_STREAM_MODE", "native"),
             ("XBRIDGE_STREAM_ENCODING", "audio/x-l16"),
         ]);
         Config::apply_env_overrides_with(&mut config, env);
 
         assert_eq!(config.sip.transport, SipTransport::Tls);
-        assert_eq!(config.stream.mode, StreamMode::Native);
+
         assert_eq!(config.stream.encoding, AudioEncoding::L16);
     }
 
@@ -754,7 +748,6 @@ sample_rate = 16000
             ("XBRIDGE_SIP_TRANSPORT", "invalid"),
             ("XBRIDGE_SIP_RTP_PORT_MIN", "not_a_number"),
             ("XBRIDGE_SIP_SRTP", "maybe"),
-            ("XBRIDGE_STREAM_MODE", "unknown"),
             ("XBRIDGE_STREAM_ENCODING", "audio/opus"),
         ]);
         Config::apply_env_overrides_with(&mut config, env);
@@ -763,7 +756,7 @@ sample_rate = 16000
         assert_eq!(config.sip.transport, SipTransport::Udp);
         assert_eq!(config.sip.rtp_port_min, 0);
         assert!(!config.sip.srtp);
-        assert_eq!(config.stream.mode, StreamMode::Twilio);
+
         assert_eq!(config.stream.encoding, AudioEncoding::Mulaw);
     }
 
@@ -835,6 +828,12 @@ sample_rate = 16000
         assert_eq!(trunks[0].sip.host, "sip.a.com");
         assert_eq!(trunks[1].name, "secondary");
         assert_eq!(trunks[1].sip.host, "sip.b.com");
+    }
+
+    #[test]
+    fn resolved_trunks_empty_when_no_credentials() {
+        let config = Config::default();
+        assert!(config.resolved_trunks().is_empty());
     }
 
     #[test]

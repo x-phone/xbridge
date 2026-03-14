@@ -11,10 +11,13 @@ xbridge connects SIP trunks to your application via WebSocket (audio) + REST (ca
 ## Features
 
 - **SIP trunk registration** with any provider (Telnyx, Twilio, VoIP.ms, etc.)
+- **SIP trunk host** — accept calls directly from PBX systems (Asterisk, FreePBX, etc.)
+- **Outbound to peers** — originate calls to PBX extensions via REST API
 - **WebSocket audio streaming** — Twilio-compatible JSON/base64 or native binary mode
 - **REST call control** — create, hangup, hold, resume, transfer, DTMF, mute/unmute
 - **Incoming call webhooks** — accept/reject decisions via your app
 - **Multi-trunk support** — register with multiple SIP providers simultaneously
+- **Peer authentication** — IP allowlist and/or SIP digest auth
 - **Bearer token auth** and **rate limiting**
 - **Prometheus metrics** at `/metrics`
 - **TLS support** via rustls
@@ -86,7 +89,6 @@ Every config field can be overridden via `XBRIDGE_*` environment variables:
 | `XBRIDGE_WEBHOOK_URL` | Webhook endpoint URL |
 | `XBRIDGE_WEBHOOK_TIMEOUT` | Webhook timeout (e.g. `5s`, `500ms`) |
 | `XBRIDGE_WEBHOOK_RETRY` | Webhook retry count |
-| `XBRIDGE_STREAM_MODE` | `twilio` or `native` |
 | `XBRIDGE_STREAM_ENCODING` | `audio/x-mulaw` or `audio/x-l16` |
 | `XBRIDGE_STREAM_SAMPLE_RATE` | Sample rate in Hz |
 | `XBRIDGE_AUTH_API_KEY` | API key for Bearer token auth |
@@ -114,6 +116,32 @@ trunks:
 
 Specify a trunk for outbound calls via the `trunk` field in the create call request. If omitted, the `"default"` trunk is used.
 
+### SIP Trunk Host (Direct PBX)
+
+To accept calls directly from PBX systems without a cloud trunk provider, add a `server` block:
+
+```yaml
+server:
+  listen: "0.0.0.0:5080"
+  peers:
+    - name: "office-pbx"
+      host: "192.168.1.10"        # IP-based auth
+      port: 5060                  # SIP port for outbound (default: 5060)
+      codecs: ["ulaw", "alaw"]
+
+    - name: "remote-office"
+      auth:                       # SIP digest auth
+        username: "remote-trunk"
+        password: "secret"
+      codecs: ["ulaw"]
+```
+
+Calls from peers enter the same flow as trunk calls — webhook notification, REST control, WebSocket audio. The webhook payload includes a `peer` field identifying which peer originated the call.
+
+**Authentication** — peers can authenticate via IP allowlist (`host`), SIP digest credentials (`auth`), or both. Unauthenticated INVITEs are rejected with 403.
+
+**Outbound to peers** — originate calls to PBX extensions by specifying `peer` in the create call request (see [Create Call](#create-call-outbound) below). The peer must have a `host` configured.
+
 ## REST API
 
 All API endpoints require `Authorization: Bearer <api_key>` when `auth.api_key` is configured.
@@ -124,11 +152,23 @@ All API endpoints require `Authorization: Bearer <api_key>` when `auth.api_key` 
 POST /v1/calls
 ```
 
+Via SIP trunk provider:
+
 ```json
 {
   "to": "+15551234567",
   "from": "+15559876543",
   "trunk": "telnyx"
+}
+```
+
+Or via a configured peer (PBX):
+
+```json
+{
+  "to": "1002",
+  "from": "1001",
+  "peer": "office-pbx"
 }
 ```
 
@@ -267,7 +307,7 @@ DELETE /v1/webhooks/failures
 
 Connect to `ws://host:8080/ws/{call_id}` to stream audio for a call.
 
-### Twilio-Compatible Mode (`stream.mode: twilio`)
+### Twilio-Compatible Mode (default)
 
 Server sends JSON text frames:
 
@@ -288,15 +328,15 @@ Client sends:
 {"event": "media", "streamSid": "call_id", "media": {"payload": "<base64>"}}
 ```
 
-### Native Mode (`stream.mode: native`)
+### Native Binary Mode (`?mode=native`)
 
-After the initial JSON `connected` and `start` text frames, audio is sent as binary frames:
+Connect to `ws://host:8080/ws/{call_id}?mode=native` to use binary mode. After the initial JSON `connected` and `start` text frames, audio is sent as binary frames:
 
 ```
 [0x01][2 bytes: length big-endian][PCM16 LE audio bytes]
 ```
 
-This reduces overhead by avoiding JSON encoding and base64 for every audio frame.
+This reduces overhead by avoiding JSON encoding and base64 for every audio frame. The mode is selected per-connection via the `mode` query parameter (default: `twilio`).
 
 ## Webhooks
 
@@ -311,9 +351,12 @@ When a call arrives, xbridge POSTs to `{webhook_url}/incoming`:
   "call_id": "abc123",
   "from": "+15551234567",
   "to": "+15559876543",
-  "direction": "inbound"
+  "direction": "inbound",
+  "peer": "office-pbx"
 }
 ```
+
+The `peer` field is present only for calls from configured peers (trunk host mode). Calls from SIP trunk providers omit it.
 
 Your app responds with:
 
@@ -366,11 +409,17 @@ GET /metrics
 ```
 
 Exposed metrics:
-- `xbridge_calls_total{direction}` — total calls (counter)
+- `xbridge_calls_total{direction}` — total calls by direction (counter)
 - `xbridge_active_calls` — currently active calls (gauge)
+- `xbridge_http_requests_total` — total HTTP API requests (counter)
 - `xbridge_ws_connections` — active WebSocket connections (gauge)
-- `xbridge_http_requests_total` — total HTTP requests (counter)
-- `xbridge_webhooks_total{result}` — webhook deliveries (counter)
+- `xbridge_ws_frames_total{direction}` — WebSocket frames sent/received (counter)
+- `xbridge_webhooks_total{result}` — webhook deliveries by result (counter)
+- `xbridge_trunk_calls_total` — calls from trunk host peers (counter)
+- `xbridge_rate_limit_rejections_total` — requests rejected by rate limiter (counter)
+- `xbridge_call_duration_seconds` — call duration (histogram)
+- `xbridge_http_request_duration_seconds` — HTTP request latency (histogram)
+- `xbridge_webhook_duration_seconds` — webhook delivery latency (histogram)
 
 ## TLS
 
@@ -393,43 +442,45 @@ xbridge is designed as a **data plane** — it handles real-time SIP signaling, 
 For production deployments that need call recordings, CDR storage, billing, or dashboards, the intended architecture is a separate **control plane** that consumes xbridge's webhook events and WebSocket audio:
 
 ```
-┌─────────────┐    webhooks     ┌─────────────────┐
-│             │ ──────────────> │                 │
-│   xbridge   │                 │  Control Plane  │──> DB, S3, dashboards
-│ (data plane)│ <────────────── │                 │
-│             │   REST calls    │                 │
-└──────┬──────┘                 └────────┬────────┘
-       │                                 │
-   SIP/RTP                          WebSocket
-       │                           (audio tap)
-       v                                 │
-┌──────────────┐                         v
-│  SIP Trunk   │                 ┌──────────────┐
-│  (Telnyx,    │                 │  Recording / │
-│   Twilio)    │                 │  Transcription│
-└──────────────┘                 └──────────────┘
+                                  webhooks     ┌─────────────────┐
+                              ──────────────> │                 │
+┌──────────────┐              ┌───────────┐   │  Control Plane  │──> DB, S3, dashboards
+│  SIP Trunk   │──SIP/RTP──> │           │ <──│                 │
+│  (Telnyx,    │   client    │           │    └────────┬────────┘
+│   Twilio)    │              │  xbridge  │             │
+└──────────────┘              │           │        WebSocket
+                              │           │       (audio tap)
+┌──────────────┐              │           │             │
+│  PBX         │──SIP/RTP──> │           │             v
+│  (Asterisk,  │   :5080     │           │    ┌──────────────┐
+│   FreePBX)   │              └───────────┘    │  Recording / │
+└──────────────┘                               │  Transcription│
+                                               └──────────────┘
 ```
 
 **How it works:**
 
-1. xbridge fires webhook events (`call.ringing`, `call.answered`, `call.ended`, etc.) to the control plane — this is the existing `webhook.url` config.
-2. The control plane persists call events, manages state, and exposes dashboards.
-3. For recordings, the control plane connects to the `ws_url` returned by xbridge (from the create call response or incoming call webhook), receives the audio stream, and writes it to storage (disk, S3, etc.).
-4. The control plane drives call actions (hangup, transfer, DTMF) via xbridge's REST API.
+1. Calls arrive via SIP trunk providers (as a client) or directly from PBX systems (as a server on `:5080`). Both paths produce the same webhook events and REST/WebSocket interfaces.
+2. xbridge fires webhook events (`call.ringing`, `call.answered`, `call.ended`, etc.) to the control plane.
+3. The control plane persists call events, manages state, and exposes dashboards.
+4. For recordings, the control plane connects to the `ws_url` returned by xbridge, receives the audio stream, and writes it to storage (disk, S3, etc.).
+5. The control plane drives call actions (hangup, transfer, DTMF) via xbridge's REST API.
 
 This separation keeps xbridge fast and simple — it never touches disk for call data — while letting you build whatever persistence and business logic you need on top.
 
 ## Demo
 
-Run the **[Echo Bot Demo](demo/)** to test the full pipeline in under 2 minutes:
+Two demo setups are included:
+
+- **[Voice AI Demo](demo/voice-ai/)** — full-stack with xpbx, softphone, xbridge, and an AI voice agent with live transcription
+- **[SIP Trunk Demo](demo/sip-trunk/)** — connect xbridge directly to Twilio or Telnyx for PSTN calls, no PBX needed
 
 ```bash
-cd demo
-# Edit config.yaml with your SIP credentials
+cd demo/voice-ai
 docker compose up --build
 ```
 
-Call your SIP number and hear your voice echoed back. Press `*` to hang up via the REST API.
+Open http://localhost:3000, enter a Deepgram API key, register a softphone as extension 1001, and dial 2000 to talk to the AI agent.
 
 ## Integration Guide
 

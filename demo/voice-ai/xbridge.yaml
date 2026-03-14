@@ -1,0 +1,20 @@
+listen:
+  http: "0.0.0.0:8090"
+
+# Trunk host mode — accept SIP from Asterisk/xpbx
+server:
+  listen: "0.0.0.0:5080"
+  rtp_port_min: 10200
+  rtp_port_max: 10300
+  rtp_address: "10.200.0.20"
+  peers:
+    - name: "xpbx"
+      host: "10.200.0.10"
+
+webhook:
+  url: "http://10.200.0.30:3000/webhook"
+  timeout: "5s"
+
+stream:
+  encoding: "audio/x-l16"
+  sample_rate: 8000
