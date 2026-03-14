@@ -89,7 +89,6 @@ Every config field can be overridden via `XBRIDGE_*` environment variables:
 | `XBRIDGE_WEBHOOK_URL` | Webhook endpoint URL |
 | `XBRIDGE_WEBHOOK_TIMEOUT` | Webhook timeout (e.g. `5s`, `500ms`) |
 | `XBRIDGE_WEBHOOK_RETRY` | Webhook retry count |
-| `XBRIDGE_STREAM_MODE` | `twilio` or `native` |
 | `XBRIDGE_STREAM_ENCODING` | `audio/x-mulaw` or `audio/x-l16` |
 | `XBRIDGE_STREAM_SAMPLE_RATE` | Sample rate in Hz |
 | `XBRIDGE_AUTH_API_KEY` | API key for Bearer token auth |
@@ -308,7 +307,7 @@ DELETE /v1/webhooks/failures
 
 Connect to `ws://host:8080/ws/{call_id}` to stream audio for a call.
 
-### Twilio-Compatible Mode (`stream.mode: twilio`)
+### Twilio-Compatible Mode (default)
 
 Server sends JSON text frames:
 
@@ -329,15 +328,15 @@ Client sends:
 {"event": "media", "streamSid": "call_id", "media": {"payload": "<base64>"}}
 ```
 
-### Native Mode (`stream.mode: native`)
+### Native Binary Mode (`?mode=native`)
 
-After the initial JSON `connected` and `start` text frames, audio is sent as binary frames:
+Connect to `ws://host:8080/ws/{call_id}?mode=native` to use binary mode. After the initial JSON `connected` and `start` text frames, audio is sent as binary frames:
 
 ```
 [0x01][2 bytes: length big-endian][PCM16 LE audio bytes]
 ```
 
-This reduces overhead by avoiding JSON encoding and base64 for every audio frame.
+This reduces overhead by avoiding JSON encoding and base64 for every audio frame. The mode is selected per-connection via the `mode` query parameter (default: `twilio`).
 
 ## Webhooks
 
@@ -410,11 +409,17 @@ GET /metrics
 ```
 
 Exposed metrics:
-- `xbridge_calls_total{direction}` — total calls (counter)
+- `xbridge_calls_total{direction}` — total calls by direction (counter)
 - `xbridge_active_calls` — currently active calls (gauge)
+- `xbridge_http_requests_total` — total HTTP API requests (counter)
 - `xbridge_ws_connections` — active WebSocket connections (gauge)
-- `xbridge_http_requests_total` — total HTTP requests (counter)
-- `xbridge_webhooks_total{result}` — webhook deliveries (counter)
+- `xbridge_ws_frames_total{direction}` — WebSocket frames sent/received (counter)
+- `xbridge_webhooks_total{result}` — webhook deliveries by result (counter)
+- `xbridge_trunk_calls_total` — calls from trunk host peers (counter)
+- `xbridge_rate_limit_rejections_total` — requests rejected by rate limiter (counter)
+- `xbridge_call_duration_seconds` — call duration (histogram)
+- `xbridge_http_request_duration_seconds` — HTTP request latency (histogram)
+- `xbridge_webhook_duration_seconds` — webhook delivery latency (histogram)
 
 ## TLS
 
@@ -465,15 +470,17 @@ This separation keeps xbridge fast and simple — it never touches disk for call
 
 ## Demo
 
-Run the **[Echo Bot Demo](demo/)** to test the full pipeline in under 2 minutes:
+Two demo setups are included:
+
+- **[Voice AI Demo](demo/voice-ai/)** — full-stack with xpbx, softphone, xbridge, and an AI voice agent with live transcription
+- **[SIP Trunk Demo](demo/sip-trunk/)** — connect xbridge directly to Twilio or Telnyx for PSTN calls, no PBX needed
 
 ```bash
-cd demo
-# Edit config.yaml with your SIP credentials
+cd demo/voice-ai
 docker compose up --build
 ```
 
-Call your SIP number and hear your voice echoed back. Press `*` to hang up via the REST API.
+Open http://localhost:3000, enter a Deepgram API key, register a softphone as extension 1001, and dial 2000 to talk to the AI agent.
 
 ## Integration Guide
 

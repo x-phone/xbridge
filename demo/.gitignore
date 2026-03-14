@@ -2,3 +2,4 @@
 *.db
 voice-app/frontend/node_modules/
 voice-app/frontend/dist/
+sip-trunk/xbridge.yaml

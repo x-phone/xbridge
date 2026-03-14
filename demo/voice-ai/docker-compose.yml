@@ -1,31 +1,37 @@
+# Voice AI Demo — xpbx + xbridge + voice-app
+#
+# Requires xpbx repo cloned as sibling: ../../../xpbx/
+# Install: git clone https://github.com/x-phone/xpbx.git
+#
+# Usage:
+#   cd demo/voice-ai
+#   docker compose up --build
+
 services:
   asterisk:
     image: andrius/asterisk:latest
     entrypoint: ["/scripts/entrypoint.sh", "-f"]
     tty: true
     stdin_open: true
-    user: "0"   # Root needed to create /data/sounds on shared volume
+    user: "0"
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"
       - "10000-10099:10000-10099/udp"
     volumes:
-      # Base Asterisk config from xpbx
-      - ../../xpbx/asterisk/config:/etc/asterisk
-      - ../../xpbx/asterisk/scripts/entrypoint.sh:/scripts/entrypoint.sh:ro
-      # Demo overrides (voiceworker → xbridge, extension 1001, route 2000)
-      - ./xpbx-overrides/pjsip.conf:/etc/asterisk/pjsip.conf:ro
-      - ./xpbx-overrides/extensions.conf:/etc/asterisk/extensions.conf:ro
-      - ./xpbx-overrides/sorcery.conf:/etc/asterisk/sorcery.conf:ro
+      - ../../../xpbx/asterisk/config:/etc/asterisk
+      - ../../../xpbx/asterisk/scripts/entrypoint.sh:/scripts/entrypoint.sh:ro
       - demo-data:/data
     environment:
       - EXTERNAL_IP=${EXTERNAL_IP:-}
+      - VOICEWORKER_HOST=xbridge:5080
+      - VOICEWORKER_EXTEN=2000
     networks:
       demo:
         ipv4_address: 10.200.0.10
 
   xpbx:
-    build: ../../xpbx/server
+    build: ../../../xpbx/server
     environment:
       - XPBX_LISTEN_ADDR=:8080
       - XPBX_DB_PATH=/data/asterisk-realtime.db
@@ -42,7 +48,7 @@ services:
 
   xbridge:
     build:
-      context: ..
+      context: ../..
       dockerfile: Dockerfile
     ports:
       - "8090:8090"
@@ -58,7 +64,7 @@ services:
         ipv4_address: 10.200.0.20
 
   voice-app:
-    build: ./voice-app
+    build: ../voice-app
     ports:
       - "3000:3000"
     environment:

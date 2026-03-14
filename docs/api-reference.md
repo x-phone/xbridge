@@ -72,18 +72,47 @@ Prometheus-format metrics. No authentication required.
 
 **Response** `200 OK` (`text/plain; version=0.0.4; charset=utf-8`)
 ```
-# HELP xbridge_active_calls Current active calls
+# HELP xbridge_calls_total Total calls processed
+# TYPE xbridge_calls_total counter
+xbridge_calls_total {direction="inbound"} 105
+xbridge_calls_total {direction="outbound"} 42
+# HELP xbridge_active_calls Currently active calls
 # TYPE xbridge_active_calls gauge
 xbridge_active_calls 3
-# HELP xbridge_calls_total Total calls created
-# TYPE xbridge_calls_total counter
-xbridge_calls_total 147
-# HELP xbridge_calls_outbound Total outbound calls
-# TYPE xbridge_calls_outbound counter
-xbridge_calls_outbound 42
-# HELP xbridge_ws_connections Current WebSocket connections
+# HELP xbridge_http_requests_total Total HTTP requests
+# TYPE xbridge_http_requests_total counter
+xbridge_http_requests_total 1520
+# HELP xbridge_ws_connections Active WebSocket connections
 # TYPE xbridge_ws_connections gauge
 xbridge_ws_connections 3
+# HELP xbridge_ws_frames_total WebSocket frames processed
+# TYPE xbridge_ws_frames_total counter
+xbridge_ws_frames_total {direction="sent"} 45230
+xbridge_ws_frames_total {direction="received"} 44100
+# HELP xbridge_webhooks_total Total webhook deliveries
+# TYPE xbridge_webhooks_total counter
+xbridge_webhooks_total {result="success"} 310
+xbridge_webhooks_total {result="failure"} 2
+# HELP xbridge_trunk_calls_total Total calls from trunk host peers
+# TYPE xbridge_trunk_calls_total counter
+xbridge_trunk_calls_total 58
+# HELP xbridge_rate_limit_rejections_total HTTP requests rejected by rate limiter
+# TYPE xbridge_rate_limit_rejections_total counter
+xbridge_rate_limit_rejections_total 0
+# HELP xbridge_call_duration_seconds Call duration
+# TYPE xbridge_call_duration_seconds histogram
+xbridge_call_duration_seconds_bucket{le="1"} 5
+xbridge_call_duration_seconds_bucket{le="5"} 12
+...
+xbridge_call_duration_seconds_bucket{le="+Inf"} 147
+xbridge_call_duration_seconds_sum 8532.5
+xbridge_call_duration_seconds_count 147
+# HELP xbridge_http_request_duration_seconds HTTP request duration
+# TYPE xbridge_http_request_duration_seconds histogram
+...
+# HELP xbridge_webhook_duration_seconds Webhook delivery duration
+# TYPE xbridge_webhook_duration_seconds histogram
+...
 ```
 
 ---
@@ -333,12 +362,18 @@ Drain (clear) the dead letter queue.
 ### Connection
 
 ```
-GET /ws/{call_id}
+GET /ws/{call_id}[?mode=native]
 Authorization: Bearer <api_key>
 Upgrade: websocket
 ```
 
 Connect after accepting an incoming call or creating an outbound call. The `call_id` comes from the webhook payload or the create-call response.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | `"twilio"` | Stream mode: `"twilio"` (JSON/base64) or `"native"` (binary frames) |
 
 Returns `404` if the call doesn't exist.
 
@@ -485,7 +520,7 @@ Clear the server-side audio buffer. Use for barge-in (stop playing queued TTS wh
 
 ### Native Binary Mode
 
-When `stream.mode` is set to `"native"`, audio frames are sent as binary WebSocket frames instead of JSON, reducing overhead.
+When the `mode=native` query parameter is set on the WebSocket connection URL, audio frames are sent as binary WebSocket frames instead of JSON, reducing overhead.
 
 **Binary frame format:**
 
@@ -693,7 +728,6 @@ webhook:
   retry: 1                    # Retry count after first failure. Default: 1
 
 stream:
-  mode: "twilio"              # "twilio" (JSON/base64) or "native" (binary). Default: "twilio"
   encoding: "audio/x-mulaw"   # "audio/x-mulaw" or "audio/x-l16". Default: "audio/x-mulaw"
   sample_rate: 8000           # Audio sample rate in Hz. Default: 8000
 
@@ -794,7 +828,6 @@ Every config field can be overridden via environment variables:
 | `XBRIDGE_WEBHOOK_URL` | `webhook.url` |
 | `XBRIDGE_WEBHOOK_TIMEOUT` | `webhook.timeout` |
 | `XBRIDGE_WEBHOOK_RETRY` | `webhook.retry` |
-| `XBRIDGE_STREAM_MODE` | `stream.mode` |
 | `XBRIDGE_STREAM_ENCODING` | `stream.encoding` |
 | `XBRIDGE_STREAM_SAMPLE_RATE` | `stream.sample_rate` |
 | `XBRIDGE_AUTH_API_KEY` | `auth.api_key` |

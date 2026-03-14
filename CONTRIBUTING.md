@@ -32,11 +32,14 @@ cargo fmt       # Format
 - `src/wav.rs` — Minimal WAV file parser
 - `src/webhook.rs` — Webhook event definitions
 - `src/webhook_client.rs` — Webhook delivery with retry and dead letter queue
-- `src/metrics.rs` — Prometheus metrics
+- `src/metrics.rs` — Prometheus metrics (counters, gauges, histograms)
 - `src/call.rs` — Call state types
 - `src/api.rs` — REST request/response types
+- `src/trunk/config.rs` — Trunk host server configuration
+- `src/trunk/server.rs` — Trunk host server (wraps xphone::Server)
 - `tests/integration.rs` — Integration tests
 - `docs/guide.md` — Integration guide with Python examples
+- `docs/api-reference.md` — Complete API reference
 
 ## Code Style
 

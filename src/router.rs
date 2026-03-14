@@ -663,14 +663,23 @@ async fn drain_webhook_failures(State(state): State<AppState>) -> Json<serde_jso
     Json(serde_json::json!({ "drained": failures.len() }))
 }
 
+/// Query parameters for the WebSocket endpoint.
+#[derive(Debug, serde::Deserialize, Default)]
+struct WsQuery {
+    /// Stream mode: "twilio" (default) or "native".
+    mode: Option<StreamMode>,
+}
+
 async fn ws_handler(
     State(state): State<AppState>,
     Path(call_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
     let call = get_xphone_call(&state, &call_id).await?;
+    let mode = query.mode.unwrap_or(StreamMode::Twilio);
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, call_id, call, state)))
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, call_id, call, state, mode)))
 }
 
 async fn handle_ws(
@@ -678,8 +687,8 @@ async fn handle_ws(
     call_id: String,
     call: Arc<dyn CallControl>,
     state: AppState,
+    mode: StreamMode,
 ) {
-    let mode = state.config.stream.mode.clone();
     let encoding = state.config.stream.encoding.clone();
     let sample_rate = state.config.stream.sample_rate;
     let metrics = state.metrics.clone();
@@ -744,7 +753,7 @@ async fn handle_ws(
     let mark_tx = audio_tx.clone();
 
     // Blocking reader: pcm_rx → audio_tx
-    let reader_mode = mode.clone();
+    let reader_mode = mode;
     let encoding_reader = encoding.clone();
     let cid_sender = call_id.clone();
     let mut reader_handle = tokio::task::spawn_blocking(move || {

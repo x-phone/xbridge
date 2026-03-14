@@ -33,7 +33,6 @@ webhook:
   retry: 1
 
 stream:
-  mode: "twilio"          # twilio | native
   encoding: "audio/x-mulaw"  # audio/x-mulaw | audio/x-l16
   sample_rate: 8000
 

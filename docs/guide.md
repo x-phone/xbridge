@@ -75,7 +75,6 @@ webhook:
   retry: 2
 
 stream:
-  mode: "twilio"           # Twilio-compatible JSON/base64 frames
   encoding: "audio/x-mulaw"
   sample_rate: 8000
 
@@ -571,9 +570,6 @@ webhook:
   timeout: "10s"
   retry: 2
 
-stream:
-  mode: "twilio"
-
 auth:
   api_key: "secret"
 
@@ -646,8 +642,10 @@ async def handle_call(call_id: str, caller: str):
 - [ ] Scrape `/metrics` with Prometheus
 - [ ] Key metrics to alert on:
   - `xbridge_active_calls` — capacity planning
-  - `xbridge_webhooks_total{result="error"}` — delivery failures
+  - `xbridge_webhooks_total{result="failure"}` — delivery failures
   - `xbridge_ws_connections` — should match active calls
+  - `xbridge_call_duration_seconds` — call duration distribution
+  - `xbridge_http_request_duration_seconds` — API latency
 
 ### Networking
 
@@ -695,7 +693,7 @@ xbridge is designed as a drop-in replacement for Twilio Media Streams. If you're
 - **Mark echo** — send marks and get confirmation when they're reached
 - **REST call control** — hold, resume, transfer, mute directly via API
 - **Play audio** — server-side audio playback without streaming through WebSocket
-- **Native binary mode** — lower overhead than JSON/base64 (`stream.mode: native`)
+- **Native binary mode** — lower overhead than JSON/base64 (connect with `?mode=native`)
 - **Multi-trunk** — register with multiple SIP providers simultaneously
 - **Trunk host mode** — accept calls directly from PBX systems without a cloud provider
 - **Self-hosted** — full control, no vendor lock-in, no per-minute fees

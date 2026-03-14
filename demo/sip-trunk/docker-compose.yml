@@ -1,0 +1,31 @@
+# SIP Trunk Demo — xbridge + voice-app (no PBX)
+#
+# Connect xbridge directly to a SIP trunk provider (Twilio, Telnyx, etc.)
+# to handle PSTN calls with the voice-app.
+#
+# Usage:
+#   1. Copy and edit the config: cp twilio.yaml xbridge.yaml
+#   2. Set YOUR_SERVER_IP to your public IP
+#   3. docker compose up --build
+
+services:
+  xbridge:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+      - "5080:5080/udp"
+      - "10200-10300:10200-10300/udp"
+    volumes:
+      - ./xbridge.yaml:/etc/xbridge/config.yaml:ro
+    environment:
+      - RUST_LOG=info
+
+  voice-app:
+    build: ../voice-app
+    ports:
+      - "3000:3000"
+    environment:
+      - XBRIDGE_HOST=xbridge:8090
+    depends_on: [xbridge]
