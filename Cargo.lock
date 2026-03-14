@@ -2104,7 +2104,6 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "http-body-util",
- "md5",
  "rand",
  "reqwest",
  "serde",
@@ -2121,9 +2120,9 @@ dependencies = [
 
 [[package]]
 name = "xphone"
-version = "0.3.3"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59fa384c0272dfb060f531ceda52b4f4d1356464647b5b16d31f52267b830f74"
+checksum = "c5455107b5517d3a062f0057766745ed17417fe1fa8cd339029e4a9447cf43cc"
 dependencies = [
  "aes",
  "bytes",

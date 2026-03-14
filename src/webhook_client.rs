@@ -1,10 +1,11 @@
 use crate::api::{IncomingCallResponse, IncomingCallWebhook};
 use crate::config::WebhookConfig;
+use crate::metrics::Metrics;
 use crate::webhook::WebhookEvent;
 use rand::Rng;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DLQ_MAX_SIZE: usize = 1000;
 const BACKOFF_BASE_MS: u64 = 100;
@@ -15,6 +16,7 @@ pub struct WebhookClient {
     url: String,
     retry: u32,
     dlq: Arc<Mutex<VecDeque<FailedWebhook>>>,
+    metrics: Metrics,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -26,7 +28,7 @@ pub struct FailedWebhook {
 }
 
 impl WebhookClient {
-    pub fn new(config: &WebhookConfig) -> Self {
+    pub fn new(config: &WebhookConfig, metrics: Metrics) -> Self {
         let timeout = parse_timeout(&config.timeout);
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -38,11 +40,23 @@ impl WebhookClient {
             url: config.url.clone(),
             retry: config.retry,
             dlq: Arc::new(Mutex::new(VecDeque::new())),
+            metrics,
         }
     }
 
     /// Send an incoming call webhook and return the app's response.
     pub async fn send_incoming(
+        &self,
+        hook: &IncomingCallWebhook,
+    ) -> Result<IncomingCallResponse, WebhookError> {
+        let start = Instant::now();
+        let result = self.do_send_incoming(hook).await;
+        self.metrics
+            .observe_webhook_duration(start.elapsed().as_secs_f64());
+        result
+    }
+
+    async fn do_send_incoming(
         &self,
         hook: &IncomingCallWebhook,
     ) -> Result<IncomingCallResponse, WebhookError> {
@@ -69,9 +83,17 @@ impl WebhookClient {
         let mut last_error = String::new();
 
         for attempt in 1..=attempts {
+            let start = Instant::now();
             match self.http.post(&self.url).json(event).send().await {
-                Ok(resp) if resp.status().is_success() => return,
+                Ok(resp) if resp.status().is_success() => {
+                    self.metrics
+                        .observe_webhook_duration(start.elapsed().as_secs_f64());
+                    self.metrics.inc_webhooks_sent();
+                    return;
+                }
                 Ok(resp) => {
+                    self.metrics
+                        .observe_webhook_duration(start.elapsed().as_secs_f64());
                     last_error = format!("HTTP {}", resp.status());
                     tracing::warn!(
                         "webhook POST {} returned {} (attempt {attempt}/{attempts})",
@@ -80,6 +102,8 @@ impl WebhookClient {
                     );
                 }
                 Err(e) => {
+                    self.metrics
+                        .observe_webhook_duration(start.elapsed().as_secs_f64());
                     last_error = e.to_string();
                     tracing::warn!(
                         "webhook POST {} failed: {e} (attempt {attempt}/{attempts})",
@@ -99,6 +123,7 @@ impl WebhookClient {
         }
 
         // All retries exhausted — push to dead letter queue
+        self.metrics.inc_webhooks_failed();
         tracing::error!(
             "webhook delivery failed after {attempts} attempts, queuing to DLQ: {last_error}"
         );
@@ -206,6 +231,17 @@ impl std::error::Error for WebhookError {}
 mod tests {
     use super::*;
 
+    fn test_client() -> WebhookClient {
+        WebhookClient::new(
+            &WebhookConfig {
+                url: "http://localhost/events".into(),
+                timeout: "5s".into(),
+                retry: 0,
+            },
+            Metrics::new(),
+        )
+    }
+
     #[test]
     fn parse_timeout_seconds() {
         assert_eq!(parse_timeout("5s"), Duration::from_secs(5));
@@ -225,11 +261,7 @@ mod tests {
 
     #[test]
     fn dlq_push_and_list() {
-        let client = WebhookClient::new(&WebhookConfig {
-            url: "http://localhost/events".into(),
-            timeout: "5s".into(),
-            retry: 0,
-        });
+        let client = test_client();
 
         client.push_dlq(
             WebhookEvent::Answered {
@@ -255,11 +287,7 @@ mod tests {
 
     #[test]
     fn dlq_drain_clears() {
-        let client = WebhookClient::new(&WebhookConfig {
-            url: "http://localhost/events".into(),
-            timeout: "5s".into(),
-            retry: 0,
-        });
+        let client = test_client();
 
         client.push_dlq(
             WebhookEvent::Answered {
@@ -276,11 +304,7 @@ mod tests {
 
     #[test]
     fn dlq_evicts_oldest_when_full() {
-        let client = WebhookClient::new(&WebhookConfig {
-            url: "http://localhost/events".into(),
-            timeout: "5s".into(),
-            retry: 0,
-        });
+        let client = test_client();
 
         for i in 0..DLQ_MAX_SIZE + 5 {
             client.push_dlq(

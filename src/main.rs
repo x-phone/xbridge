@@ -19,13 +19,14 @@ async fn main() {
     });
 
     let addr = config.listen.http.clone();
-    let webhook = WebhookClient::new(&config.webhook);
+    let metrics = xbridge::metrics::Metrics::new();
+    let webhook = WebhookClient::new(&config.webhook, metrics.clone());
 
     let (ended_tx, ended_rx) = tokio::sync::mpsc::channel(256);
     let (dtmf_tx, dtmf_rx) = tokio::sync::mpsc::channel(256);
     let (state_tx, state_rx) = tokio::sync::mpsc::channel(256);
 
-    let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx, state_tx);
+    let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx, state_tx, metrics);
 
     // Spawn call lifecycle consumers (must run before bridge/trunk so events are never lost)
     xbridge::bridge::spawn_event_consumers(state.clone(), ended_rx, dtmf_rx, state_rx);

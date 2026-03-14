@@ -1,6 +1,5 @@
 use axum::extract::ws::Message;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -8,7 +7,6 @@ use crate::call::CallInfo;
 use crate::call_control::CallControl;
 use crate::config::Config;
 use crate::metrics::Metrics;
-use crate::trunk::dialog::{SipOutgoing, TrunkDialog};
 use crate::webhook_client::WebhookClient;
 
 pub type CallRegistry = Arc<RwLock<HashMap<String, CallInfo>>>;
@@ -21,21 +19,6 @@ pub type WsSenderRegistry = Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<M
 
 /// Registry of active playback handles, keyed by call_id.
 pub type PlayRegistry = Arc<RwLock<HashMap<String, PlayHandle>>>;
-
-/// Entry in the trunk dialog map (SIP Call-ID → active dialog state).
-pub(crate) struct TrunkDialogEntry {
-    /// xbridge call_id for reverse lookup during cleanup.
-    pub xbridge_call_id: Option<String>,
-    /// xphone::Call reference (for simulate_bye on remote hangup).
-    pub xphone_call: Option<Arc<xphone::Call>>,
-    /// TrunkDialog reference (for updating dialog state from SIP responses).
-    pub trunk_dialog: Option<Arc<TrunkDialog>>,
-    /// When this entry was created (for TTL reaping).
-    pub created_at: std::time::Instant,
-}
-
-/// Registry of active trunk SIP dialogs, keyed by SIP Call-ID.
-pub(crate) type TrunkDialogMap = Arc<RwLock<HashMap<String, TrunkDialogEntry>>>;
 
 pub struct PlayHandle {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -56,11 +39,8 @@ pub struct AppState {
     pub(crate) ws_senders: WsSenderRegistry,
     pub(crate) plays: PlayRegistry,
     pub(crate) play_counter: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) trunk_dialogs: TrunkDialogMap,
-    /// Trunk server SIP send channel (set when trunk host server starts).
-    pub(crate) trunk_sip_tx: Arc<RwLock<Option<mpsc::Sender<SipOutgoing>>>>,
-    /// Trunk server local address (set when trunk host server starts).
-    pub(crate) trunk_local_addr: Arc<RwLock<Option<SocketAddr>>>,
+    /// Trunk host server handle (set when trunk host server starts).
+    pub(crate) xphone_server: Arc<RwLock<Option<xphone::Server>>>,
 }
 
 impl AppState {
@@ -70,6 +50,7 @@ impl AppState {
         ended_tx: mpsc::Sender<(String, xphone::EndReason, std::time::Duration)>,
         dtmf_tx: mpsc::Sender<(String, String)>,
         state_tx: mpsc::Sender<(String, xphone::CallState)>,
+        metrics: Metrics,
     ) -> Self {
         Self {
             calls: Arc::new(RwLock::new(HashMap::new())),
@@ -80,13 +61,11 @@ impl AppState {
             state_tx,
             webhook,
             config: Arc::new(config),
-            metrics: Metrics::new(),
+            metrics,
             ws_senders: Arc::new(std::sync::RwLock::new(HashMap::new())),
             plays: Arc::new(RwLock::new(HashMap::new())),
             play_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            trunk_dialogs: Arc::new(RwLock::new(HashMap::new())),
-            trunk_sip_tx: Arc::new(RwLock::new(None)),
-            trunk_local_addr: Arc::new(RwLock::new(None)),
+            xphone_server: Arc::new(RwLock::new(None)),
         }
     }
 }

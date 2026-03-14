@@ -32,12 +32,11 @@ pub fn spawn_event_consumers(
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 handle.task.abort();
             }
-            if call_id.starts_with("trunk-") {
-                let mut dialogs = ended_state.trunk_dialogs.write().await;
-                dialogs.retain(|_, entry| entry.xbridge_call_id.as_deref() != Some(&call_id));
-            }
 
             let reason_str = end_reason_str(reason);
+            ended_state
+                .metrics
+                .observe_call_duration(duration.as_secs_f64());
 
             let webhook = ended_state.webhook.clone();
             tokio::spawn(async move {
@@ -226,7 +225,6 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
                 peer: None,
             };
 
-            state.metrics.inc_calls_total();
             state.metrics.inc_calls_inbound();
 
             // Insert into both registries (brief TOCTOU window between the two awaits)
@@ -251,7 +249,7 @@ async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
         }
         IncomingCallAction::Reject => {
             let reason = response.reason.as_deref().unwrap_or("busy");
-            let code = crate::trunk::util::reject_reason_to_sip_code(reason);
+            let code = crate::trunk::server::reject_reason_to_sip_code(reason);
             tracing::info!("rejecting call {call_id}: {reason}");
             let _ = call.reject(code, reason);
         }

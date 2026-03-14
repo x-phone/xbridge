@@ -60,8 +60,12 @@ pub fn app(state: AppState) -> Router {
             auth_middleware,
         ))
         .route_layer(middleware::from_fn_with_state(
-            rate_limiter,
+            (rate_limiter, state.metrics.clone()),
             rate_limit_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            http_metrics_middleware,
         ));
 
     Router::new()
@@ -113,12 +117,13 @@ impl RateLimiter {
 }
 
 async fn rate_limit_middleware(
-    State(limiter): State<Option<RateLimiter>>,
+    State((limiter, metrics)): State<(Option<RateLimiter>, crate::metrics::Metrics)>,
     req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
     if let Some(ref limiter) = limiter {
         if !limiter.try_acquire() {
+            metrics.inc_rate_limit_rejections();
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
     }
@@ -146,6 +151,20 @@ async fn auth_middleware(
         }
         _ => Err(StatusCode::UNAUTHORIZED),
     }
+}
+
+async fn http_metrics_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    let start = Instant::now();
+    let response = next.run(req).await;
+    state.metrics.inc_http_requests();
+    state
+        .metrics
+        .observe_http_request_duration(start.elapsed().as_secs_f64());
+    response
 }
 
 async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -284,7 +303,6 @@ async fn create_call(
             .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
     }
 
-    state.metrics.inc_calls_total();
     state.metrics.inc_calls_outbound();
 
     // Wire callbacks
@@ -306,95 +324,36 @@ async fn create_call_to_peer(
     req: &CreateCallRequest,
     peer_name: &str,
 ) -> Result<Json<CreateCallResponse>, StatusCode> {
-    // Look up peer config.
+    // Verify peer exists in config.
     let server_config = state.config.server.as_ref().ok_or_else(|| {
         tracing::error!("peer '{peer_name}' requested but no trunk server configured");
         StatusCode::NOT_FOUND
     })?;
-    let peer = crate::trunk::auth::find_peer(server_config, peer_name)
-        .ok_or_else(|| {
-            tracing::error!("peer '{peer_name}' not found in server config");
-            StatusCode::NOT_FOUND
-        })?;
-    let peer_ip = peer.host.ok_or_else(|| {
-        tracing::error!("peer '{peer_name}' has no host IP for outbound calls");
-        StatusCode::UNPROCESSABLE_ENTITY
-    })?;
+    if !server_config.peers.iter().any(|p| p.name == peer_name) {
+        tracing::error!("peer '{peer_name}' not found in server config");
+        return Err(StatusCode::NOT_FOUND);
+    }
 
-    // Get trunk server infrastructure.
-    let sip_tx = state.trunk_sip_tx.read().await.clone().ok_or_else(|| {
+    // Get trunk server handle.
+    let server = state.xphone_server.read().await.clone().ok_or_else(|| {
         tracing::error!("trunk server not running, cannot dial peer");
         StatusCode::SERVICE_UNAVAILABLE
     })?;
-    let local_addr = state.trunk_local_addr.read().await.ok_or_else(|| {
-        tracing::error!("trunk server local address not available");
-        StatusCode::SERVICE_UNAVAILABLE
-    })?;
 
-    let rtp_port_min = server_config.rtp_port_min;
-    let rtp_port_max = server_config.rtp_port_max;
-
-    // Use rtp_address for SIP Contact/Via when listening on 0.0.0.0.
-    let sip_addr = server_config
-        .rtp_address
-        .map(|ip| std::net::SocketAddr::new(ip, local_addr.port()))
-        .unwrap_or(local_addr);
-
-    // Allocate RTP port.
-    let (rtp_socket, rtp_port) =
-        xphone::media::listen_rtp_port(rtp_port_min, rtp_port_max).map_err(|e| {
-            tracing::error!("RTP port allocation failed for peer call: {e}");
+    // Dial via xphone::Server.
+    let peer = peer_name.to_string();
+    let to = req.to.clone();
+    let from = req.from.clone();
+    let call = tokio::task::spawn_blocking(move || server.dial(&peer, &to, &from))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            tracing::error!("dial to peer '{peer_name}' failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Build SDP offer.
-    let local_ip = server_config
-        .rtp_address
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| local_addr.ip().to_string());
-    let sdp_offer = xphone::sdp::build_offer(
-        &local_ip,
-        rtp_port as i32,
-        &[0, 8, 101], // PCMU, PCMA, telephone-event
-        xphone::sdp::DIR_SEND_RECV,
-    );
+    let call_id = call.id();
 
-    // Create dialog and call.
-    let sip_call_id = crate::trunk::util::uuid_v4();
-    let local_tag = crate::trunk::util::generate_tag();
-    let remote_addr = std::net::SocketAddr::new(peer_ip, peer.port);
-
-    let from_header = format!(
-        "<sip:{}@{}>",
-        req.from, sip_addr
-    );
-    let to_header = format!(
-        "<sip:{}@{}>",
-        req.to, remote_addr
-    );
-
-    let dialog = Arc::new(crate::trunk::dialog::TrunkDialog::new_outbound(
-        sip_tx.clone(),
-        sip_addr,
-        remote_addr,
-        sip_call_id.clone(),
-        local_tag.clone(),
-        from_header.clone(),
-        to_header.clone(),
-    ));
-
-    let opts = xphone::DialOptions {
-        caller_id: Some(req.from.clone()),
-        ..Default::default()
-    };
-
-    let call = xphone::Call::new_outbound(dialog.clone() as Arc<dyn xphone::dialog::Dialog>, opts);
-    call.set_local_media(&local_ip, rtp_port as i32);
-    call.set_rtp_socket(rtp_socket);
-
-    let call_id = format!("trunk-{}", crate::trunk::util::uuid_v4());
-
-    // Register in state.
     let info = CallInfo {
         call_id: call_id.clone(),
         from: req.from.clone(),
@@ -404,7 +363,6 @@ async fn create_call_to_peer(
         peer: Some(peer_name.to_string()),
     };
 
-    state.metrics.inc_calls_total();
     state.metrics.inc_calls_outbound();
 
     {
@@ -416,35 +374,11 @@ async fn create_call_to_peer(
             .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
     }
 
-    // Track in trunk_dialogs for response routing and cleanup.
-    state.trunk_dialogs.write().await.insert(
-        sip_call_id.clone(),
-        crate::state::TrunkDialogEntry {
-            xbridge_call_id: Some(call_id.clone()),
-            xphone_call: Some(call.clone()),
-            trunk_dialog: Some(dialog),
-            created_at: std::time::Instant::now(),
-        },
-    );
-
-    // Wire callbacks.
     bridge::wire_call_callbacks(&call, &call_id, state);
     bridge::wire_outbound_state_callbacks(&call, &call_id, state);
 
-    // Send INVITE to peer.
-    crate::trunk::server::build_and_send_invite(&crate::trunk::server::InviteParams {
-        sip_tx: &sip_tx,
-        local_addr: sip_addr,
-        remote_addr,
-        sip_call_id: &sip_call_id,
-        local_tag: &local_tag,
-        from: &req.from,
-        to: &req.to,
-        sdp: &sdp_offer,
-    });
-
     tracing::info!(
-        "outbound call {call_id} to peer '{peer_name}' at {remote_addr}: {} → {}",
+        "outbound call {call_id} to peer '{peer_name}': {} → {}",
         req.from,
         req.to
     );
@@ -864,11 +798,13 @@ async fn handle_ws(
     });
 
     // Async sender: audio_rx → ws_tx
+    let sender_metrics = metrics.clone();
     let mut sender_handle = tokio::spawn(async move {
         while let Some(msg) = audio_rx.recv().await {
             if ws_tx.send(msg).await.is_err() {
                 break;
             }
+            sender_metrics.inc_ws_frames_sent();
         }
         // Send stop event (best effort)
         let stop = ServerEvent::Stop {
@@ -881,12 +817,14 @@ async fn handle_ws(
     });
 
     // Receiver: WebSocket → xphone audio (client audio to call)
+    let receiver_metrics = metrics.clone();
     let mut receiver_handle = tokio::spawn(async move {
         let b64 = base64::engine::general_purpose::STANDARD;
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
                 Message::Binary(data) if mode == StreamMode::Native => {
                     if let Some(pcm_bytes) = crate::ws::decode_native_audio(&data) {
+                        receiver_metrics.inc_ws_frames_received();
                         let pcm = audio::bytes_to_pcm16(pcm_bytes);
                         let _ = pcm_tx.try_send(pcm);
                     }
@@ -896,6 +834,7 @@ async fn handle_ws(
                         match event {
                             ClientEvent::Media { media, .. } => {
                                 if let Ok(bytes) = b64.decode(&media.payload) {
+                                    receiver_metrics.inc_ws_frames_received();
                                     let pcm = match encoding {
                                         AudioEncoding::Mulaw => audio::mulaw_to_pcm16(&bytes),
                                         AudioEncoding::L16 => audio::bytes_to_pcm16(&bytes),
@@ -985,13 +924,17 @@ mod tests {
         }
     }
 
+    fn test_state_from_config(config: Config) -> AppState {
+        let metrics = crate::metrics::Metrics::new();
+        let webhook = WebhookClient::new(&config.webhook, metrics.clone());
+        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
+        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
+        let (state_tx, _) = tokio::sync::mpsc::channel(32);
+        AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx, metrics)
+    }
+
     fn test_state() -> AppState {
-        let config = test_config();
-        let webhook = WebhookClient::new(&config.webhook);
-        let (ended_tx, _ended_rx) = tokio::sync::mpsc::channel(32);
-        let (dtmf_tx, _dtmf_rx) = tokio::sync::mpsc::channel(32);
-        let (state_tx, _state_rx) = tokio::sync::mpsc::channel(32);
-        AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx)
+        test_state_from_config(test_config())
     }
 
     fn sample_call(id: &str) -> CallInfo {
@@ -2015,11 +1958,7 @@ mod tests {
             rtp_port_max: 0,
             rtp_address: None,
         });
-        let webhook = WebhookClient::new(&config.webhook);
-        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
-        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
-        let (state_tx, _) = tokio::sync::mpsc::channel(32);
-        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+        let state = test_state_from_config(config);
 
         let resp = app(state)
             .oneshot(
@@ -2038,54 +1977,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_call_to_peer_no_host_returns_422() {
-        let mut config = test_config();
-        config.server = Some(crate::trunk::config::ServerConfig {
-            listen: "0.0.0.0:5080".into(),
-            peers: vec![crate::trunk::config::PeerConfig {
-                name: "no-host".into(),
-                host: None,
-                hosts: vec![],
-                port: 5060,
-                auth: None,
-                codecs: vec![],
-                rtp_address: None,
-            }],
-            rtp_port_min: 0,
-            rtp_port_max: 0,
-            rtp_address: None,
-        });
-        let webhook = WebhookClient::new(&config.webhook);
-        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
-        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
-        let (state_tx, _) = tokio::sync::mpsc::channel(32);
-        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
-
-        let resp = app(state)
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/calls")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"to":"+15551234567","from":"+15559876543","peer":"no-host"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
     async fn create_call_to_peer_trunk_not_running_returns_503() {
-        use std::net::{IpAddr, Ipv4Addr};
         let mut config = test_config();
         config.server = Some(crate::trunk::config::ServerConfig {
             listen: "0.0.0.0:5080".into(),
             peers: vec![crate::trunk::config::PeerConfig {
                 name: "office".into(),
-                host: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                host: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
                 hosts: vec![],
                 port: 5060,
                 auth: None,
@@ -2096,12 +1994,8 @@ mod tests {
             rtp_port_max: 0,
             rtp_address: None,
         });
-        let webhook = WebhookClient::new(&config.webhook);
-        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
-        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
-        let (state_tx, _) = tokio::sync::mpsc::channel(32);
-        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
-        // trunk_sip_tx is None (server not started) → 503
+        let state = test_state_from_config(config);
+        // xphone_server is None (server not started) → 503
 
         let resp = app(state)
             .oneshot(
@@ -2163,11 +2057,7 @@ mod tests {
         config.auth = AuthConfig {
             api_key: Some(api_key.into()),
         };
-        let webhook = WebhookClient::new(&config.webhook);
-        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
-        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
-        let (state_tx, _) = tokio::sync::mpsc::channel(32);
-        AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx)
+        test_state_from_config(config)
     }
 
     #[tokio::test]
@@ -2276,11 +2166,7 @@ mod tests {
     async fn rate_limit_returns_429() {
         let mut config = test_config();
         config.rate_limit.requests_per_second = Some(1); // 1 rps, burst = 2
-        let webhook = WebhookClient::new(&config.webhook);
-        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
-        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
-        let (state_tx, _) = tokio::sync::mpsc::channel(32);
-        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+        let state = test_state_from_config(config);
 
         let router = app(state);
 
@@ -2316,11 +2202,7 @@ mod tests {
     async fn rate_limit_does_not_affect_health() {
         let mut config = test_config();
         config.rate_limit.requests_per_second = Some(1);
-        let webhook = WebhookClient::new(&config.webhook);
-        let (ended_tx, _) = tokio::sync::mpsc::channel(32);
-        let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
-        let (state_tx, _) = tokio::sync::mpsc::channel(32);
-        let state = AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx);
+        let state = test_state_from_config(config);
 
         let router = app(state);
 

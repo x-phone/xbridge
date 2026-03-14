@@ -32,11 +32,12 @@ fn test_config() -> Config {
 }
 
 fn test_state_from(config: Config) -> AppState {
-    let webhook = WebhookClient::new(&config.webhook);
+    let metrics = xbridge::metrics::Metrics::new();
+    let webhook = WebhookClient::new(&config.webhook, metrics.clone());
     let (ended_tx, _) = tokio::sync::mpsc::channel(32);
     let (dtmf_tx, _) = tokio::sync::mpsc::channel(32);
     let (state_tx, _) = tokio::sync::mpsc::channel(32);
-    AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx)
+    AppState::new(config, webhook, ended_tx, dtmf_tx, state_tx, metrics)
 }
 
 /// Spawn the full axum server on an ephemeral port. Returns the base URL.
@@ -400,7 +401,7 @@ async fn webhook_delivers_to_mock_server() {
         timeout: "5s".into(),
         retry: 0,
     };
-    let client = WebhookClient::new(&config);
+    let client = WebhookClient::new(&config, xbridge::metrics::Metrics::new());
 
     // Send an event
     let event = xbridge::webhook::WebhookEvent::Answered {
@@ -447,7 +448,7 @@ async fn webhook_retries_on_failure() {
         timeout: "5s".into(),
         retry: 2, // 1 initial + 2 retries = 3 total
     };
-    let client = WebhookClient::new(&config);
+    let client = WebhookClient::new(&config, xbridge::metrics::Metrics::new());
 
     let event = xbridge::webhook::WebhookEvent::Answered {
         call_id: "retry_test".into(),
@@ -494,7 +495,7 @@ async fn webhook_backoff_increases_delay() {
         timeout: "5s".into(),
         retry: 3, // 1 initial + 3 retries = 4 attempts, backoff: 100ms + 200ms + 400ms = 700ms
     };
-    let client = WebhookClient::new(&config);
+    let client = WebhookClient::new(&config, xbridge::metrics::Metrics::new());
 
     let start = std::time::Instant::now();
     let event = xbridge::webhook::WebhookEvent::Answered {

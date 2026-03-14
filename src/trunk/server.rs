@@ -1,321 +1,104 @@
-//! SIP trunk host server — listens for SIP traffic from PBX peers.
+//! SIP trunk host server — thin wrapper around xphone::Server.
 //!
-//! Handles both inbound (peer → xbridge) and outbound (xbridge → peer) calls.
-//! Authenticated INVITEs are wired through xphone::Call (via TrunkDialog) so that
-//! xphone handles codec negotiation, SDP answer generation, and the full RTP media
-//! pipeline. The trunk server only handles SIP signalling transport.
+//! Converts xbridge config to xphone types, wires incoming calls to the webhook
+//! pipeline, and exposes the Server handle for outbound calls via the REST API.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 use crate::bridge;
 use crate::call_control::XphoneCall;
-use crate::state::{AppState, TrunkDialogEntry, TrunkDialogMap};
-use crate::trunk::auth::{self, AuthResult};
+use crate::state::AppState;
 use crate::trunk::config::ServerConfig;
-use crate::trunk::dialog::{SipOutgoing, TrunkDialog};
-use crate::trunk::sip_msg::{self, SipMessage, SipMethod};
-use crate::trunk::util::{ensure_to_tag, generate_branch, generate_tag, reject_reason_to_sip_code, uuid_v4};
 
 /// Run the SIP trunk host server.
 ///
-/// Listens on the configured address, authenticates incoming SIP traffic,
-/// and forwards authenticated INVITEs into xbridge's call flow via xphone::Call.
+/// Creates an xphone::Server from config, wires incoming call handling,
+/// and awaits `server.listen()`.
 pub async fn run(
     config: ServerConfig,
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket = Arc::new(UdpSocket::bind(&config.listen).await?);
-    let local_addr = socket.local_addr()?;
+    let xphone_config = config.to_xphone();
+    let server = xphone::Server::new(xphone_config);
+
+    // Store server handle in state so the router can use it for outbound calls.
+    *state.xphone_server.write().await = Some(server.clone());
+
     info!("trunk host listening on {}", config.listen);
 
-    let dialogs = state.trunk_dialogs.clone();
+    // Channel for incoming calls (xphone callback → async handler).
+    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Arc<xphone::Call>>(256);
 
-    // Channel for TrunkDialog → socket outgoing messages (bounded to prevent OOM).
-    let (sip_tx, mut sip_rx) = mpsc::channel::<SipOutgoing>(4096);
-
-    // Store sip_tx and local_addr in state so the router can use them for outbound calls.
-    *state.trunk_sip_tx.write().await = Some(sip_tx.clone());
-    *state.trunk_local_addr.write().await = Some(local_addr);
-
-    // Spawn send task: drains outgoing SIP messages and sends via the server socket.
-    let send_socket = socket.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = sip_rx.recv().await {
-            let preview = String::from_utf8_lossy(&msg.data[..msg.data.len().min(1024)]);
-            debug!("trunk SIP >>> sending {} bytes to {}:\n{}", msg.data.len(), msg.addr, preview);
-            if let Err(e) = send_socket.send_to(&msg.data, msg.addr).await {
-                warn!("trunk SIP send error: {e}");
+    server.on_incoming(move |call: Arc<xphone::Call>| {
+        if let Err(e) = incoming_tx.try_send(call) {
+            error!("incoming trunk call channel full or closed");
+            if let tokio::sync::mpsc::error::TrySendError::Full(rejected) = e {
+                let _ = rejected.reject(503, "overloaded");
             }
         }
     });
 
-    // Spawn dialog TTL reaper — cleans up leaked entries.
-    let reaper_dialogs = dialogs.clone();
+    // Spawn incoming call handler.
+    let handler_state = state.clone();
     tokio::spawn(async move {
-        reap_stale_dialogs(reaper_dialogs).await;
-    });
-
-    let mut buf = vec![0u8; 65535];
-
-    loop {
-        let (len, addr) = socket.recv_from(&mut buf).await?;
-        let data = &buf[..len];
-
-        let msg = match sip_msg::parse(data) {
-            Ok(m) => m,
-            Err(e) => {
-                debug!("ignoring unparseable SIP from {addr}: {e}");
-                continue;
-            }
-        };
-
-        if msg.is_response() {
-            handle_response(&msg, &dialogs, &sip_tx, local_addr).await;
-            continue;
-        }
-
-        match msg.method {
-            SipMethod::Options => {
-                handle_options(&socket, addr, &msg).await;
-            }
-            SipMethod::Invite => {
-                handle_invite(
-                    &config, &socket, local_addr, addr, msg, &state, &dialogs, &sip_tx,
-                )
-                .await;
-            }
-            SipMethod::Ack => {
-                debug!("ACK received for Call-ID={}", msg.call_id());
-            }
-            SipMethod::Bye => {
-                handle_bye(&socket, addr, &msg, &state, &dialogs).await;
-            }
-            SipMethod::Cancel => {
-                handle_cancel(&socket, addr, &msg, &dialogs).await;
-            }
-            ref other => {
-                debug!("unsupported SIP method '{other}' from {addr}");
-                send_response(&socket, addr, &msg, 405, "Method Not Allowed").await;
-            }
-        }
-    }
-}
-
-async fn handle_options(socket: &UdpSocket, addr: SocketAddr, msg: &SipMessage) {
-    debug!("OPTIONS from {addr}");
-    let mut resp = SipMessage::new_response(200, "OK");
-    copy_dialog_headers(msg, &mut resp);
-    resp.set_header("Allow", "INVITE,ACK,BYE,CANCEL,OPTIONS");
-    let data = resp.to_bytes();
-    if let Err(e) = socket.send_to(&data, addr).await {
-        warn!("SIP send to {addr} failed: {e}");
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_invite(
-    config: &ServerConfig,
-    socket: &Arc<UdpSocket>,
-    local_addr: SocketAddr,
-    addr: SocketAddr,
-    msg: SipMessage,
-    state: &AppState,
-    dialogs: &TrunkDialogMap,
-    sip_tx: &mpsc::Sender<SipOutgoing>,
-) {
-    let source_ip = addr.ip();
-
-    match auth::authenticate(config, &msg, source_ip) {
-        AuthResult::Authenticated(peer_name) => {
-            info!("authenticated INVITE from peer '{peer_name}' at {addr}");
-            state.metrics.inc_trunk_calls_inbound();
-
-            // Send 100 Trying immediately (before webhook dispatch).
-            send_response(socket, addr, &msg, 100, "Trying").await;
-
-            let sip_call_id = msg.call_id().to_string();
-            dialogs.write().await.insert(
-                sip_call_id.clone(),
-                TrunkDialogEntry {
-                    xbridge_call_id: None,
-                    xphone_call: None,
-                    trunk_dialog: None,
-                    created_at: std::time::Instant::now(),
-                },
-            );
-
-            let state = state.clone();
-            let dialogs = dialogs.clone();
-            let sip_tx = sip_tx.clone();
-            let rtp_port_min = config.rtp_port_min;
-            let rtp_port_max = config.rtp_port_max;
-            // Per-peer rtp_address takes priority over server-level rtp_address.
-            let rtp_address = config
-                .peers
-                .iter()
-                .find(|p| p.name == peer_name)
-                .and_then(|p| p.rtp_address)
-                .or(config.rtp_address);
+        while let Some(call) = incoming_rx.recv().await {
+            let state = handler_state.clone();
             tokio::spawn(async move {
-                handle_trunk_incoming(
-                    &msg,
-                    peer_name,
-                    state,
-                    dialogs,
-                    sip_call_id,
-                    sip_tx,
-                    local_addr,
-                    addr,
-                    rtp_port_min,
-                    rtp_port_max,
-                    rtp_address,
-                )
-                .await;
+                handle_incoming(call, state).await;
             });
         }
-        AuthResult::Challenge { realm, nonce } => {
-            info!("challenging INVITE from {addr} (no IP match)");
-            let mut resp = SipMessage::new_response(401, "Unauthorized");
-            copy_dialog_headers(&msg, &mut resp);
-            resp.set_header(
-                "WWW-Authenticate",
-                &auth::build_www_authenticate(&realm, &nonce),
-            );
-            let data = resp.to_bytes();
-            if let Err(e) = socket.send_to(&data, addr).await {
-                warn!("SIP send to {addr} failed: {e}");
-            }
-        }
-        AuthResult::Rejected => {
-            warn!("rejected INVITE from unknown source {addr}");
-            state.metrics.inc_trunk_auth_failures();
-            send_response(socket, addr, &msg, 403, "Forbidden").await;
-        }
-    }
+    });
+
+    server.listen().await.map_err(|e| e.into())
 }
 
-/// Handle an authenticated incoming trunk call: create xphone::Call, dispatch webhook,
-/// accept/reject, wire callbacks.
-#[allow(clippy::too_many_arguments)]
-async fn handle_trunk_incoming(
-    invite: &SipMessage,
-    peer_name: String,
-    state: AppState,
-    dialogs: TrunkDialogMap,
-    sip_call_id: String,
-    sip_tx: mpsc::Sender<SipOutgoing>,
-    local_addr: SocketAddr,
-    remote_addr: SocketAddr,
-    rtp_port_min: u16,
-    rtp_port_max: u16,
-    rtp_address: Option<std::net::IpAddr>,
-) {
-    let call_id = format!("trunk-{}", uuid_v4());
-    let from = invite.from_user().to_string();
-    let to = invite.to_user().to_string();
+/// Handle an authenticated incoming trunk call: dispatch webhook, accept/reject,
+/// register in state, wire callbacks.
+async fn handle_incoming(call: Arc<xphone::Call>, state: AppState) {
+    let call_id = call.id();
+    let from = call.from();
+    let to = call.to();
 
-    info!(
-        "trunk incoming call {call_id} from peer '{peer_name}': {from} → {to}"
-    );
-
-    // Use rtp_address for SIP Contact/Via when the server listens on 0.0.0.0,
-    // otherwise peers can't route BYE back to us.
-    let sip_addr = match rtp_address {
-        Some(ip) => SocketAddr::new(ip, local_addr.port()),
-        None => local_addr,
-    };
+    info!("trunk incoming call {call_id}: {from} → {to}");
 
     // ── Webhook dispatch ──
-
     let hook = crate::api::IncomingCallWebhook {
         call_id: call_id.clone(),
         from: from.clone(),
         to: to.clone(),
         direction: crate::call::CallDirection::Inbound,
-        peer: Some(peer_name.clone()),
+        peer: None,
     };
 
     let response = match state.webhook.send_incoming(&hook).await {
         Ok(resp) => resp,
         Err(e) => {
             error!("incoming webhook failed for trunk call {call_id}: {e}");
-            send_reject_via_channel(&sip_tx, invite, remote_addr, 503, "Service Unavailable");
-            dialogs.write().await.remove(&sip_call_id);
+            let _ = call.reject(503, "service unavailable");
             return;
         }
     };
 
     match response.action {
         crate::api::IncomingCallAction::Accept => {
-            // ── Allocate RTP port ──
-            let (rtp_socket, rtp_port) =
-                match xphone::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        error!("RTP port allocation failed for trunk call {call_id}: {e}");
-                        send_reject_via_channel(
-                            &sip_tx,
-                            invite,
-                            remote_addr,
-                            503,
-                            "Service Unavailable",
-                        );
-                        dialogs.write().await.remove(&sip_call_id);
-                        return;
-                    }
-                };
-
-            // ── Create TrunkDialog + xphone::Call ──
-            let local_tag = generate_tag();
-            let dialog = Arc::new(TrunkDialog::new(
-                sip_tx,
-                sip_addr,
-                remote_addr,
-                invite,
-                local_tag,
-            ));
-
-            let call = xphone::Call::new_inbound(dialog);
-
-            let local_ip = rtp_address
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| local_addr.ip().to_string());
-
-            call.set_local_media(&local_ip, rtp_port as i32);
-            call.set_rtp_socket(rtp_socket);
-
-            // Set remote SDP from INVITE body (enables codec negotiation in accept()).
-            if !invite.body.is_empty() {
-                if let Ok(sdp_str) = std::str::from_utf8(&invite.body) {
-                    call.set_remote_sdp(sdp_str);
-                }
-            }
-
-            // ── Accept the call ──
-            // Call::accept() negotiates codecs, builds SDP answer, sends 200 OK via
-            // TrunkDialog::respond(), and starts the RTP media pipeline.
             if let Err(e) = call.accept() {
                 error!("failed to accept trunk call {call_id}: {e}");
-                dialogs.write().await.remove(&sip_call_id);
                 return;
             }
 
-            // ── Track in state registries ──
             let info = crate::call::CallInfo {
                 call_id: call_id.clone(),
                 from,
                 to,
                 direction: crate::call::CallDirection::Inbound,
                 status: crate::call::CallStatus::InProgress,
-                peer: Some(peer_name),
+                peer: None,
             };
 
-            state.metrics.inc_calls_total();
             state.metrics.inc_calls_inbound();
+            state.metrics.inc_trunk_calls_inbound();
 
             {
                 state.calls.write().await.insert(call_id.clone(), info);
@@ -326,16 +109,8 @@ async fn handle_trunk_incoming(
                     .insert(call_id.clone(), Arc::new(XphoneCall(call.clone())));
             }
 
-            // Track xphone call in dialog for BYE cleanup.
-            if let Some(entry) = dialogs.write().await.get_mut(&sip_call_id) {
-                entry.xbridge_call_id = Some(call_id.clone());
-                entry.xphone_call = Some(call.clone());
-            }
-
-            // Wire on_ended / on_dtmf callbacks (shared with trunk-provider path).
             bridge::wire_call_callbacks(&call, &call_id, &state);
 
-            // Send call.answered webhook.
             state
                 .webhook
                 .send_event(&crate::webhook::WebhookEvent::Answered {
@@ -347,680 +122,17 @@ async fn handle_trunk_incoming(
             let reason = response.reason.as_deref().unwrap_or("busy");
             let code = reject_reason_to_sip_code(reason);
             info!("rejecting trunk call {call_id}: {reason}");
-            send_reject_via_channel(&sip_tx, invite, remote_addr, code, reason);
-            dialogs.write().await.remove(&sip_call_id);
+            let _ = call.reject(code, reason);
         }
     }
 }
 
-/// Build and send a SIP error response via the outgoing channel (for pre-Call paths).
-fn send_reject_via_channel(
-    tx: &mpsc::Sender<SipOutgoing>,
-    invite: &SipMessage,
-    remote_addr: SocketAddr,
-    code: u16,
-    reason: &str,
-) {
-    let mut resp = SipMessage::new_response(code, reason);
-    copy_dialog_headers(invite, &mut resp);
-    if let Err(e) = tx.try_send(SipOutgoing {
-        data: resp.to_bytes(),
-        addr: remote_addr,
-    }) {
-        warn!("failed to send SIP {code} reject to {remote_addr}: {e}");
+/// Map a reject reason string to a SIP status code.
+pub(crate) fn reject_reason_to_sip_code(reason: &str) -> u16 {
+    match reason {
+        "busy" => 486,
+        "declined" => 603,
+        _ => 486,
     }
 }
 
-async fn handle_bye(
-    socket: &UdpSocket,
-    addr: SocketAddr,
-    msg: &SipMessage,
-    _state: &AppState,
-    dialogs: &TrunkDialogMap,
-) {
-    let sip_call_id = msg.call_id().to_string();
-    debug!("BYE from {addr} for Call-ID={sip_call_id}");
-
-    // Remove dialog and tell xphone::Call about remote hangup.
-    // simulate_bye() fires on_ended → bridge cleanup task removes from all registries.
-    if let Some(dialog) = dialogs.write().await.remove(&sip_call_id) {
-        if let Some(call) = dialog.xphone_call {
-            call.simulate_bye();
-        }
-    }
-
-    send_response(socket, addr, msg, 200, "OK").await;
-}
-
-async fn handle_cancel(
-    socket: &UdpSocket,
-    addr: SocketAddr,
-    msg: &SipMessage,
-    dialogs: &TrunkDialogMap,
-) {
-    let sip_call_id = msg.call_id().to_string();
-    debug!("CANCEL from {addr} for Call-ID={sip_call_id}");
-
-    let removed = dialogs.write().await.remove(&sip_call_id);
-    send_response(socket, addr, msg, 200, "OK").await;
-
-    if let Some(dialog) = removed {
-        // Tell xphone::Call about cancellation (if call was created but not yet accepted).
-        if let Some(call) = dialog.xphone_call {
-            call.simulate_bye();
-        }
-
-        // Send 487 Request Terminated for the original INVITE.
-        let mut resp = SipMessage::new_response(487, "Request Terminated");
-        copy_dialog_headers(msg, &mut resp);
-        let (seq, _) = msg.cseq();
-        resp.set_header("CSeq", &format!("{seq} INVITE"));
-        let data = resp.to_bytes();
-        if let Err(e) = socket.send_to(&data, addr).await {
-            warn!("SIP send to {addr} failed: {e}");
-        }
-    }
-}
-
-/// TTL thresholds for dialog reaping.
-const SETUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-const ACTIVE_TTL: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
-const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Periodically scan trunk dialogs and remove entries that have exceeded their TTL.
-///
-/// - Entries still in setup (no xphone_call): 30 seconds — covers webhook hang, RTP failure.
-/// - Active entries (xphone_call present): 4 hours — safety net for vanished peers.
-async fn reap_stale_dialogs(dialogs: TrunkDialogMap) {
-    loop {
-        tokio::time::sleep(REAP_INTERVAL).await;
-
-        let now = std::time::Instant::now();
-        let mut dialogs = dialogs.write().await;
-        let before = dialogs.len();
-
-        dialogs.retain(|sip_call_id, entry| {
-            let age = now.duration_since(entry.created_at);
-            let ttl = if entry.xphone_call.is_some() {
-                ACTIVE_TTL
-            } else {
-                SETUP_TTL
-            };
-            if age > ttl {
-                warn!(
-                    "reaping stale dialog {sip_call_id} (age={age:.0?}, call_id={:?})",
-                    entry.xbridge_call_id
-                );
-                if let Some(ref call) = entry.xphone_call {
-                    call.simulate_bye();
-                }
-                false
-            } else {
-                true
-            }
-        });
-
-        let reaped = before - dialogs.len();
-        if reaped > 0 {
-            info!("reaped {reaped} stale trunk dialog(s)");
-        }
-    }
-}
-
-/// Handle a SIP response (for outbound calls to peers).
-/// Routes 1xx/2xx/error responses to the corresponding xphone::Call.
-async fn handle_response(
-    msg: &SipMessage,
-    dialogs: &TrunkDialogMap,
-    sip_tx: &mpsc::Sender<SipOutgoing>,
-    local_addr: SocketAddr,
-) {
-    let sip_call_id = msg.call_id().to_string();
-    let code = msg.status_code;
-    let (_, cseq_method) = msg.cseq();
-
-    debug!("SIP response {code} for Call-ID={sip_call_id} (CSeq method={cseq_method})");
-
-    // Only handle responses to INVITE (ignore BYE/CANCEL responses).
-    if cseq_method != SipMethod::Invite {
-        return;
-    }
-
-    let dialogs_read = dialogs.read().await;
-    let dialog_entry = match dialogs_read.get(&sip_call_id) {
-        Some(entry) => entry,
-        None => {
-            debug!("no dialog for response Call-ID={sip_call_id}");
-            return;
-        }
-    };
-
-    let call = match dialog_entry.xphone_call.as_ref() {
-        Some(c) => c.clone(),
-        None => return,
-    };
-    let trunk_dialog = dialog_entry.trunk_dialog.clone();
-    drop(dialogs_read);
-
-    match code {
-        100 => {
-            debug!("100 Trying for outbound Call-ID={sip_call_id}");
-        }
-        180 | 183 => {
-            if let Some(ref dlg) = trunk_dialog {
-                dlg.update_from_response(msg);
-            }
-            call.simulate_response(code, &msg.reason);
-        }
-        200..=299 => {
-            if let Some(ref dlg) = trunk_dialog {
-                dlg.update_from_response(msg);
-            }
-            if !msg.body.is_empty() {
-                if let Ok(sdp_str) = std::str::from_utf8(&msg.body) {
-                    call.set_remote_sdp(sdp_str);
-                }
-            }
-            call.simulate_response(200, "OK");
-
-            // Send ACK.
-            send_ack(sip_tx, msg, &sip_call_id, local_addr);
-        }
-        _ => {
-            // 3xx/4xx/5xx/6xx: call failed.
-            warn!("outbound call {sip_call_id} rejected with {code}");
-            call.simulate_bye();
-            dialogs.write().await.remove(&sip_call_id);
-        }
-    }
-}
-
-/// Send ACK for a 200 OK response to our outbound INVITE.
-fn send_ack(
-    tx: &mpsc::Sender<SipOutgoing>,
-    ok_response: &SipMessage,
-    sip_call_id: &str,
-    local_addr: SocketAddr,
-) {
-    // ACK Request-URI comes from the Contact header of the 200 OK,
-    // or fall back to the To header URI.
-    let contact = ok_response.header("Contact");
-    let request_uri = if !contact.is_empty() {
-        crate::trunk::dialog::extract_uri(contact).to_string()
-    } else {
-        let to = ok_response.header("To");
-        crate::trunk::dialog::extract_uri(to).to_string()
-    };
-
-    // ACK destination: parse host:port from Contact URI or Request-URI.
-    let dest_addr = parse_addr_from_uri(&request_uri)
-        .unwrap_or_else(|| "0.0.0.0:5060".parse().unwrap());
-
-    let branch = generate_branch();
-    let mut ack = SipMessage::new_request(SipMethod::Ack, &request_uri);
-    ack.set_header(
-        "Via",
-        &format!("SIP/2.0/UDP {local_addr};branch={branch}"),
-    );
-    ack.set_header("From", ok_response.header("From"));
-    ack.set_header("To", ok_response.header("To"));
-    ack.set_header("Call-ID", sip_call_id);
-    // ACK CSeq must match the INVITE's CSeq number.
-    let (cseq_num, _) = ok_response.cseq();
-    ack.set_header("CSeq", &format!("{cseq_num} ACK"));
-
-    if let Err(e) = tx.try_send(SipOutgoing {
-        data: ack.to_bytes(),
-        addr: dest_addr,
-    }) {
-        warn!("failed to send ACK for Call-ID={sip_call_id}: {e}");
-    }
-}
-
-/// Parse a SocketAddr from a SIP URI (e.g., "sip:1001@10.0.0.1:5060" → 10.0.0.1:5060).
-fn parse_addr_from_uri(uri: &str) -> Option<SocketAddr> {
-    let host_part = uri.split('@').nth(1)?;
-    // Try parsing as SocketAddr directly.
-    if let Ok(addr) = host_part.parse::<SocketAddr>() {
-        return Some(addr);
-    }
-    // Try parsing as IP (default port 5060).
-    if let Ok(ip) = host_part.parse::<std::net::IpAddr>() {
-        return Some(SocketAddr::new(ip, 5060));
-    }
-    None
-}
-
-/// Parameters for building an outbound INVITE.
-pub(crate) struct InviteParams<'a> {
-    pub sip_tx: &'a mpsc::Sender<SipOutgoing>,
-    pub local_addr: SocketAddr,
-    pub remote_addr: SocketAddr,
-    pub sip_call_id: &'a str,
-    pub local_tag: &'a str,
-    pub from: &'a str,
-    pub to: &'a str,
-    pub sdp: &'a str,
-}
-
-/// Build an outbound INVITE to a peer and send it via the SIP channel.
-pub(crate) fn build_and_send_invite(params: &InviteParams<'_>) {
-    let branch = generate_branch();
-    let request_uri = format!("sip:{}@{}", params.to, params.remote_addr);
-
-    let mut invite = SipMessage::new_request(SipMethod::Invite, &request_uri);
-    invite.set_header(
-        "Via",
-        &format!("SIP/2.0/UDP {};branch={branch}", params.local_addr),
-    );
-    invite.set_header(
-        "From",
-        &format!("<sip:{}@{}>;tag={}", params.from, params.local_addr, params.local_tag),
-    );
-    invite.set_header("To", &format!("<sip:{}@{}>", params.to, params.remote_addr));
-    invite.set_header("Call-ID", params.sip_call_id);
-    invite.set_header("CSeq", "1 INVITE");
-    invite.set_header(
-        "Contact",
-        &format!("<sip:xbridge@{}>", params.local_addr),
-    );
-    invite.set_header("Max-Forwards", "70");
-    invite.set_header("Content-Type", "application/sdp");
-    invite.body = params.sdp.as_bytes().to_vec();
-
-    if let Err(e) = params.sip_tx.try_send(SipOutgoing {
-        data: invite.to_bytes(),
-        addr: params.remote_addr,
-    }) {
-        warn!("failed to send INVITE to {}: {e}", params.remote_addr);
-    }
-}
-
-async fn send_response(
-    socket: &UdpSocket,
-    addr: SocketAddr,
-    req: &SipMessage,
-    code: u16,
-    reason: &str,
-) {
-    let mut resp = SipMessage::new_response(code, reason);
-    copy_dialog_headers(req, &mut resp);
-    let data = resp.to_bytes();
-    if let Err(e) = socket.send_to(&data, addr).await {
-        warn!("SIP send to {addr} failed: {e}");
-    }
-}
-
-fn copy_dialog_headers(req: &SipMessage, resp: &mut SipMessage) {
-    for via in req.header_values("Via") {
-        resp.add_header("Via", via);
-    }
-    resp.set_header("From", req.header("From"));
-    resp.set_header("To", &ensure_to_tag(req.header("To"), resp.status_code));
-    resp.set_header("Call-ID", req.header("Call-ID"));
-    resp.set_header("CSeq", req.header("CSeq"));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn copy_dialog_headers_preserves_via() {
-        let mut req = SipMessage::new_request(SipMethod::Invite, "sip:1002@xbridge:5080");
-        req.add_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK111");
-        req.add_header("Via", "SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK222");
-        req.set_header("From", "<sip:1001@pbx.local>;tag=from1");
-        req.set_header("To", "<sip:1002@xbridge:5080>");
-        req.set_header("Call-ID", "test@host");
-        req.set_header("CSeq", "1 INVITE");
-
-        let mut resp = SipMessage::new_response(200, "OK");
-        copy_dialog_headers(&req, &mut resp);
-
-        assert_eq!(resp.header_values("Via").len(), 2);
-        assert_eq!(resp.header("Call-ID"), "test@host");
-        assert_eq!(resp.header("CSeq"), "1 INVITE");
-        assert!(resp.header("From").contains("tag=from1"));
-        assert!(resp.header("To").contains("tag="));
-    }
-
-    #[test]
-    fn copy_dialog_headers_100_no_to_tag() {
-        let mut req = SipMessage::new_request(SipMethod::Invite, "sip:1002@xbridge:5080");
-        req.add_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK111");
-        req.set_header("From", "<sip:1001@pbx.local>;tag=from1");
-        req.set_header("To", "<sip:1002@xbridge:5080>");
-        req.set_header("Call-ID", "test@host");
-        req.set_header("CSeq", "1 INVITE");
-
-        let mut resp = SipMessage::new_response(100, "Trying");
-        copy_dialog_headers(&req, &mut resp);
-
-        assert!(!resp.header("To").contains("tag="));
-    }
-
-    #[test]
-    fn send_reject_via_channel_builds_response() {
-        let (tx, mut rx) = mpsc::channel(64);
-        let mut invite = SipMessage::new_request(SipMethod::Invite, "sip:1002@xbridge:5080");
-        invite.add_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK111");
-        invite.set_header("From", "<sip:1001@pbx.local>;tag=from1");
-        invite.set_header("To", "<sip:1002@xbridge:5080>");
-        invite.set_header("Call-ID", "test@host");
-        invite.set_header("CSeq", "1 INVITE");
-
-        send_reject_via_channel(
-            &tx,
-            &invite,
-            "10.0.0.1:5060".parse().unwrap(),
-            486,
-            "Busy Here",
-        );
-
-        let outgoing = rx.try_recv().unwrap();
-        let msg = sip_msg::parse(&outgoing.data).unwrap();
-        assert!(msg.is_response());
-        assert_eq!(msg.status_code, 486);
-        assert_eq!(msg.header("Call-ID"), "test@host");
-        assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
-    }
-
-    #[test]
-    fn send_ack_uses_contact_for_request_uri() {
-        let (tx, mut rx) = mpsc::channel(64);
-        let mut ok_resp = SipMessage::new_response(200, "OK");
-        ok_resp.set_header("From", "<sip:1001@127.0.0.1:5080>;tag=local1");
-        ok_resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=remote1");
-        ok_resp.set_header("Call-ID", "ack-test@xbridge");
-        ok_resp.set_header("CSeq", "1 INVITE");
-        ok_resp.set_header("Contact", "<sip:1002@10.0.0.1:5060>");
-
-        send_ack(&tx, &ok_resp, "ack-test@xbridge", "127.0.0.1:5080".parse().unwrap());
-
-        let outgoing = rx.try_recv().unwrap();
-        let msg = sip_msg::parse(&outgoing.data).unwrap();
-        assert_eq!(msg.method, SipMethod::Ack);
-        assert_eq!(msg.request_uri, "sip:1002@10.0.0.1:5060");
-        assert_eq!(msg.header("Call-ID"), "ack-test@xbridge");
-        assert_eq!(msg.header("CSeq"), "1 ACK");
-        assert!(msg.header("From").contains("tag=local1"));
-        assert!(msg.header("To").contains("tag=remote1"));
-        assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
-    }
-
-    #[test]
-    fn send_ack_falls_back_to_to_header() {
-        let (tx, mut rx) = mpsc::channel(64);
-        let mut ok_resp = SipMessage::new_response(200, "OK");
-        ok_resp.set_header("From", "<sip:1001@127.0.0.1:5080>;tag=local1");
-        ok_resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=remote1");
-        ok_resp.set_header("Call-ID", "ack-test@xbridge");
-        ok_resp.set_header("CSeq", "1 INVITE");
-        // No Contact header.
-
-        send_ack(&tx, &ok_resp, "ack-test@xbridge", "127.0.0.1:5080".parse().unwrap());
-
-        let outgoing = rx.try_recv().unwrap();
-        let msg = sip_msg::parse(&outgoing.data).unwrap();
-        assert_eq!(msg.method, SipMethod::Ack);
-        assert_eq!(msg.request_uri, "sip:1002@10.0.0.1:5060");
-    }
-
-    #[tokio::test]
-    async fn handle_response_ignores_non_invite() {
-        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let (sip_tx, _rx) = mpsc::channel(64);
-
-        let mut resp = SipMessage::new_response(200, "OK");
-        resp.set_header("Call-ID", "test@host");
-        resp.set_header("CSeq", "1 BYE");
-
-        // Should return early without panicking (no dialog needed).
-        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
-    }
-
-    #[tokio::test]
-    async fn handle_response_ignores_unknown_call_id() {
-        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let (sip_tx, _rx) = mpsc::channel(64);
-
-        let mut resp = SipMessage::new_response(180, "Ringing");
-        resp.set_header("Call-ID", "unknown@host");
-        resp.set_header("CSeq", "1 INVITE");
-
-        // Should return early without panicking.
-        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
-    }
-
-    #[tokio::test]
-    async fn handle_response_error_removes_dialog() {
-        use crate::trunk::dialog::TrunkDialog;
-        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let (sip_tx, _rx) = mpsc::channel(64);
-        let (dlg_tx, _dlg_rx) = mpsc::channel(64);
-
-        let trunk_dialog = Arc::new(TrunkDialog::new_outbound(
-            dlg_tx,
-            "127.0.0.1:5080".parse().unwrap(),
-            "10.0.0.1:5060".parse().unwrap(),
-            "reject-test@xbridge".into(),
-            "tag1".into(),
-            "<sip:1001@127.0.0.1:5080>".into(),
-            "<sip:1002@10.0.0.1:5060>".into(),
-        ));
-        let call = xphone::Call::new_outbound(
-            trunk_dialog.clone() as Arc<dyn xphone::dialog::Dialog>,
-            xphone::DialOptions::default(),
-        );
-
-        dialogs.write().await.insert(
-            "reject-test@xbridge".into(),
-            TrunkDialogEntry {
-                xbridge_call_id: Some("trunk-test".into()),
-                xphone_call: Some(call),
-                trunk_dialog: Some(trunk_dialog),
-                created_at: std::time::Instant::now(),
-            },
-        );
-
-        let mut resp = SipMessage::new_response(486, "Busy Here");
-        resp.set_header("Call-ID", "reject-test@xbridge");
-        resp.set_header("CSeq", "1 INVITE");
-
-        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
-
-        // Dialog should be removed after error response.
-        assert!(dialogs.read().await.get("reject-test@xbridge").is_none());
-    }
-
-    #[tokio::test]
-    async fn handle_response_200_sends_ack() {
-        use crate::trunk::dialog::TrunkDialog;
-        let dialogs: TrunkDialogMap = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let (sip_tx, mut sip_rx) = mpsc::channel(64);
-        let (dlg_tx, _dlg_rx) = mpsc::channel(64);
-
-        let trunk_dialog = Arc::new(TrunkDialog::new_outbound(
-            dlg_tx,
-            "127.0.0.1:5080".parse().unwrap(),
-            "10.0.0.1:5060".parse().unwrap(),
-            "ok-test@xbridge".into(),
-            "tag1".into(),
-            "<sip:1001@127.0.0.1:5080>".into(),
-            "<sip:1002@10.0.0.1:5060>".into(),
-        ));
-        let call = xphone::Call::new_outbound(
-            trunk_dialog.clone() as Arc<dyn xphone::dialog::Dialog>,
-            xphone::DialOptions::default(),
-        );
-
-        dialogs.write().await.insert(
-            "ok-test@xbridge".into(),
-            TrunkDialogEntry {
-                xbridge_call_id: Some("trunk-ok".into()),
-                xphone_call: Some(call),
-                trunk_dialog: Some(trunk_dialog),
-                created_at: std::time::Instant::now(),
-            },
-        );
-
-        let mut resp = SipMessage::new_response(200, "OK");
-        resp.set_header("Call-ID", "ok-test@xbridge");
-        resp.set_header("CSeq", "1 INVITE");
-        resp.set_header("Contact", "<sip:1002@10.0.0.1:5060>");
-        resp.set_header("From", "<sip:1001@127.0.0.1:5080>;tag=tag1");
-        resp.set_header("To", "<sip:1002@10.0.0.1:5060>;tag=remote1");
-        resp.body = b"v=0\r\n".to_vec();
-
-        handle_response(&resp, &dialogs, &sip_tx, "127.0.0.1:5080".parse().unwrap()).await;
-
-        // ACK should be sent.
-        let outgoing = sip_rx.try_recv().unwrap();
-        let ack = sip_msg::parse(&outgoing.data).unwrap();
-        assert_eq!(ack.method, SipMethod::Ack);
-        assert_eq!(ack.header("Call-ID"), "ok-test@xbridge");
-        // Dialog should still exist (not removed on success).
-        assert!(dialogs.read().await.get("ok-test@xbridge").is_some());
-    }
-
-    #[test]
-    fn parse_addr_from_sip_uri() {
-        assert_eq!(
-            parse_addr_from_uri("sip:1001@10.0.0.1:5060"),
-            Some("10.0.0.1:5060".parse().unwrap())
-        );
-        assert_eq!(
-            parse_addr_from_uri("sip:1001@192.168.1.1"),
-            Some("192.168.1.1:5060".parse().unwrap())
-        );
-        assert!(parse_addr_from_uri("sip:1001").is_none());
-    }
-
-    #[test]
-    fn build_outbound_invite_message() {
-        let (tx, mut rx) = mpsc::channel(64);
-        build_and_send_invite(&InviteParams {
-            sip_tx: &tx,
-            local_addr: "127.0.0.1:5080".parse().unwrap(),
-            remote_addr: "10.0.0.1:5060".parse().unwrap(),
-            sip_call_id: "test-call-id@xbridge",
-            local_tag: "localtag1",
-            from: "1001",
-            to: "1002",
-            sdp: "v=0\r\n",
-        });
-
-        let outgoing = rx.try_recv().unwrap();
-        let msg = sip_msg::parse(&outgoing.data).unwrap();
-        assert!(!msg.is_response());
-        assert_eq!(msg.method, SipMethod::Invite);
-        assert_eq!(msg.request_uri, "sip:1002@10.0.0.1:5060");
-        assert_eq!(msg.header("Call-ID"), "test-call-id@xbridge");
-        assert!(msg.header("From").contains("1001@127.0.0.1:5080"));
-        assert!(msg.header("From").contains("tag=localtag1"));
-        assert!(msg.header("To").contains("1002@10.0.0.1:5060"));
-        assert_eq!(msg.header("CSeq"), "1 INVITE");
-        assert_eq!(msg.header("Content-Type"), "application/sdp");
-        assert_eq!(String::from_utf8_lossy(&msg.body), "v=0\r\n");
-        assert_eq!(outgoing.addr, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
-    }
-
-    #[tokio::test]
-    async fn reaper_removes_stale_setup_entry() {
-        let dialogs: TrunkDialogMap =
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-
-        // Insert an entry with a created_at far in the past (simulates stuck setup).
-        dialogs.write().await.insert(
-            "stale-setup@xbridge".into(),
-            TrunkDialogEntry {
-                xbridge_call_id: None,
-                xphone_call: None,
-                trunk_dialog: None,
-                created_at: std::time::Instant::now() - SETUP_TTL - std::time::Duration::from_secs(1),
-            },
-        );
-
-        // Insert a fresh entry that should survive.
-        dialogs.write().await.insert(
-            "fresh@xbridge".into(),
-            TrunkDialogEntry {
-                xbridge_call_id: Some("trunk-fresh".into()),
-                xphone_call: None,
-                trunk_dialog: None,
-                created_at: std::time::Instant::now(),
-            },
-        );
-
-        assert_eq!(dialogs.read().await.len(), 2);
-
-        // Run one reap cycle inline (extract the retain logic).
-        {
-            let now = std::time::Instant::now();
-            let mut map = dialogs.write().await;
-            map.retain(|_, entry| {
-                let age = now.duration_since(entry.created_at);
-                let ttl = if entry.xphone_call.is_some() {
-                    ACTIVE_TTL
-                } else {
-                    SETUP_TTL
-                };
-                age <= ttl
-            });
-        }
-
-        assert_eq!(dialogs.read().await.len(), 1);
-        assert!(dialogs.read().await.get("stale-setup@xbridge").is_none());
-        assert!(dialogs.read().await.get("fresh@xbridge").is_some());
-    }
-
-    #[tokio::test]
-    async fn reaper_removes_stale_active_entry() {
-        use crate::trunk::dialog::TrunkDialog;
-        let dialogs: TrunkDialogMap =
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let (dlg_tx, _dlg_rx) = mpsc::channel(64);
-
-        let trunk_dialog = Arc::new(TrunkDialog::new_outbound(
-            dlg_tx,
-            "127.0.0.1:5080".parse().unwrap(),
-            "10.0.0.1:5060".parse().unwrap(),
-            "stale-active@xbridge".into(),
-            "tag1".into(),
-            "<sip:1001@127.0.0.1:5080>".into(),
-            "<sip:1002@10.0.0.1:5060>".into(),
-        ));
-        let call = xphone::Call::new_outbound(
-            trunk_dialog.clone() as Arc<dyn xphone::dialog::Dialog>,
-            xphone::DialOptions::default(),
-        );
-
-        // Active entry but created 4+ hours ago.
-        dialogs.write().await.insert(
-            "stale-active@xbridge".into(),
-            TrunkDialogEntry {
-                xbridge_call_id: Some("trunk-stale".into()),
-                xphone_call: Some(call),
-                trunk_dialog: Some(trunk_dialog),
-                created_at: std::time::Instant::now() - ACTIVE_TTL - std::time::Duration::from_secs(1),
-            },
-        );
-
-        {
-            let now = std::time::Instant::now();
-            let mut map = dialogs.write().await;
-            map.retain(|_, entry| {
-                let age = now.duration_since(entry.created_at);
-                let ttl = if entry.xphone_call.is_some() {
-                    ACTIVE_TTL
-                } else {
-                    SETUP_TTL
-                };
-                age <= ttl
-            });
-        }
-
-        assert!(dialogs.read().await.is_empty());
-    }
-}
