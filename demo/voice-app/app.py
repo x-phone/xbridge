@@ -328,7 +328,7 @@ async def webhook_events(req: Request):
 # -- Audio pipeline (dispatcher) ---------------------------------------------
 
 async def _pipeline(call_id: str):
-    url = f"ws://{XBRIDGE}/ws/{call_id}"
+    url = f"ws://{XBRIDGE}/ws/{call_id}?mode=native"
     try:
         async with websockets.connect(url) as ws:
             log.info("xbridge WS connected for %s", call_id)
