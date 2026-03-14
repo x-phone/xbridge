@@ -113,10 +113,7 @@ pub fn spawn_event_consumers(
 
 /// Start the SIP bridge: register with all configured trunks, handle incoming calls.
 /// Returns `Ok(())` immediately when no trunks are configured (trunk-host-only mode).
-pub async fn run(
-    config: &Config,
-    state: AppState,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(config: &Config, state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let trunks = config.resolved_trunks();
     if trunks.is_empty() {
         tracing::info!("no SIP trunks configured, skipping trunk client");

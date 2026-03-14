@@ -167,7 +167,10 @@ password = "secret"
         assert_eq!(config.listen, "0.0.0.0:5080");
         assert_eq!(config.peers.len(), 2);
         assert_eq!(config.peers[0].name, "office-pbx");
-        assert_eq!(config.peers[1].auth.as_ref().unwrap().username, "remote-trunk");
+        assert_eq!(
+            config.peers[1].auth.as_ref().unwrap().username,
+            "remote-trunk"
+        );
     }
 
     #[test]
@@ -253,9 +256,15 @@ peers:
         assert_eq!(xp.rtp_address, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert_eq!(xp.peers.len(), 2);
         assert_eq!(xp.peers[0].name, "pbx");
-        assert_eq!(xp.peers[0].host, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
+        assert_eq!(
+            xp.peers[0].host,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)))
+        );
         assert_eq!(xp.peers[1].name, "twilio");
         assert_eq!(xp.peers[1].hosts, vec!["54.172.60.0/30"]);
-        assert_eq!(xp.peers[1].rtp_address, Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+        assert_eq!(
+            xp.peers[1].rtp_address,
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
     }
 }

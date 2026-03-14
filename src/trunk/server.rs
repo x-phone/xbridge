@@ -16,10 +16,7 @@ use crate::trunk::config::ServerConfig;
 ///
 /// Creates an xphone::Server from config, wires incoming call handling,
 /// and awaits `server.listen()`.
-pub async fn run(
-    config: ServerConfig,
-    state: AppState,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(config: ServerConfig, state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let xphone_config = config.to_xphone();
     let server = xphone::Server::new(xphone_config);
 
@@ -135,4 +132,3 @@ pub(crate) fn reject_reason_to_sip_code(reason: &str) -> u16 {
         _ => 486,
     }
 }
-

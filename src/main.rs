@@ -26,7 +26,14 @@ async fn main() {
     let (dtmf_tx, dtmf_rx) = tokio::sync::mpsc::channel(256);
     let (state_tx, state_rx) = tokio::sync::mpsc::channel(256);
 
-    let state = AppState::new(config.clone(), webhook, ended_tx, dtmf_tx, state_tx, metrics);
+    let state = AppState::new(
+        config.clone(),
+        webhook,
+        ended_tx,
+        dtmf_tx,
+        state_tx,
+        metrics,
+    );
 
     // Spawn call lifecycle consumers (must run before bridge/trunk so events are never lost)
     xbridge::bridge::spawn_event_consumers(state.clone(), ended_rx, dtmf_rx, state_rx);
@@ -45,9 +52,7 @@ async fn main() {
         let server_config = server_config.clone();
         let trunk_state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                xbridge::trunk::server::run(server_config, trunk_state).await
-            {
+            if let Err(e) = xbridge::trunk::server::run(server_config, trunk_state).await {
                 tracing::error!("trunk host server error: {e}");
             }
         });

@@ -57,7 +57,9 @@ impl Metrics {
     }
 
     pub fn inc_trunk_calls_inbound(&self) {
-        self.inner.trunk_calls_inbound.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .trunk_calls_inbound
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_rate_limit_rejections(&self) {
@@ -71,7 +73,9 @@ impl Metrics {
     }
 
     pub fn inc_ws_frames_received(&self) {
-        self.inner.ws_frames_received.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .ws_frames_received
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn observe_call_duration(&self, secs: f64) {
@@ -164,10 +168,14 @@ struct Histogram {
 }
 
 /// Default buckets suitable for latencies in seconds.
-const DEFAULT_BUCKETS: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+const DEFAULT_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Buckets for call duration (seconds).
-const CALL_DURATION_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0];
+const CALL_DURATION_BUCKETS: &[f64] = &[
+    1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+];
 
 impl Histogram {
     fn new(bounds: &'static [f64]) -> Self {
