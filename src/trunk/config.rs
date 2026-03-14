@@ -82,7 +82,6 @@ impl ServerConfig {
             rtp_port_min: self.rtp_port_min,
             rtp_port_max: self.rtp_port_max,
             rtp_address: self.rtp_address,
-            ..Default::default()
         }
     }
 }
@@ -97,7 +96,6 @@ impl PeerConfig {
             auth: self.auth.as_ref().map(|a| a.to_xphone()),
             codecs: self.codecs.clone(),
             rtp_address: self.rtp_address,
-            ..Default::default()
         }
     }
 }
