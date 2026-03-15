@@ -1,16 +1,18 @@
 listen:
   http: "0.0.0.0:8080"
 
-# Single trunk (simple setup)
+# SIP client — register on a PBX as an extension or with a cloud trunk provider.
+# Works the same way for both: xbridge registers as a SIP client and receives
+# calls via webhooks + WebSocket audio.
 sip:
   username: "1001"
   password: "your-sip-password"
-  host: "sip.your-provider.com"
-  transport: "udp"        # udp | tcp | tls
-  rtp_port_min: 0          # 0 = OS-assigned (dev/testing)
-  rtp_port_max: 0          # For production, use a fixed range:
-  # rtp_port_min: 10000    #   small:  10000–10100
-  # rtp_port_max: 10100    #   medium: 10000–20000
+  host: "192.168.1.10"          # PBX address or cloud provider (e.g. sip.telnyx.com)
+  transport: "udp"              # udp | tcp | tls
+  rtp_port_min: 0               # 0 = OS-assigned (dev/testing)
+  rtp_port_max: 0               # For production, use a fixed range:
+  # rtp_port_min: 10000         #   small:  10000–10100
+  # rtp_port_max: 10100         #   medium: 10000–20000
   srtp: false
   # stun_server: "stun.l.google.com:19302"
 
@@ -33,24 +35,31 @@ webhook:
   retry: 1
 
 stream:
-  encoding: "audio/x-mulaw"  # audio/x-mulaw | audio/x-l16
+  encoding: "audio/x-mulaw"    # audio/x-mulaw | audio/x-l16
   sample_rate: 8000
 
-# SIP trunk host — accept calls directly from PBX systems
+# SIP trunk host — accept calls directly from PBX systems or trunk providers
 # server:
 #   listen: "0.0.0.0:5080"
 #   rtp_port_min: 0              # 0 = OS-assigned
 #   rtp_port_max: 0
+#   rtp_address: "10.200.0.20"   # IP advertised in SDP (required in Docker)
 #   peers:
 #     - name: "office-pbx"
-#       host: "192.168.1.10"     # IP-based auth
+#       host: "192.168.1.10"     # IP-based auth (single IP)
 #       port: 5060               # SIP port for outbound (default: 5060)
 #       codecs: ["ulaw", "alaw"]
+#     - name: "cloud-trunk"
+#       hosts:                   # IP-based auth (multiple IPs / CIDR ranges)
+#         - "54.172.60.0/22"
+#         - "54.244.51.0/22"
+#       codecs: ["ulaw"]
 #     - name: "remote-office"
 #       auth:                    # SIP digest auth
 #         username: "remote-trunk"
 #         password: "secret"
 #       codecs: ["ulaw"]
+#       rtp_address: "203.0.113.5"  # Per-peer RTP address override
 
 # auth:
 #   api_key: "your-secret-api-key"

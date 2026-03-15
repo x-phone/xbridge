@@ -1,21 +1,23 @@
 # xbridge Integration Guide
 
-Build AI voice agents with xbridge — a self-hosted, Twilio-compatible voice gateway.
+Build AI voice agents, IVRs, and call center apps with xbridge — a self-hosted voice gateway that bridges SIP calls to WebSocket audio and a REST API.
 
-This guide walks you through building a complete voice agent from scratch. All examples use Python with FastAPI, but xbridge works with any language that supports HTTP webhooks and WebSocket.
+This guide walks you through building a complete voice agent from scratch. All examples use Python with FastAPI, but xbridge works with any language that speaks HTTP and WebSocket.
+
+> **Want to see it working first?** Run the [Voice AI Demo](../demo/voice-ai/) — a full-stack example with softphone, PBX, xbridge, and a Deepgram-powered AI agent with live transcription. One `docker compose up` and you're talking to an AI on the phone.
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
-- [1. Start xbridge](#1-start-xbridge)
-- [2. Handle Incoming Calls](#2-handle-incoming-calls)
-- [3. Stream Audio via WebSocket](#3-stream-audio-via-websocket)
-- [4. Send Audio Back (TTS)](#4-send-audio-back-tts)
-- [5. Make Outbound Calls](#5-make-outbound-calls)
-- [6. Call Control (Hold, Transfer, DTMF)](#6-call-control-hold-transfer-dtmf)
-- [7. Play Audio Prompts](#7-play-audio-prompts)
-- [8. Monitor with Webhooks](#8-monitor-with-webhooks)
-- [9. Trunk Host Mode (PBX Integration)](#9-trunk-host-mode-pbx-integration)
+- [1. Choose a Connection Mode](#1-choose-a-connection-mode)
+- [2. Start xbridge](#2-start-xbridge)
+- [3. Handle Incoming Calls](#3-handle-incoming-calls)
+- [4. Stream Audio via WebSocket](#4-stream-audio-via-websocket)
+- [5. Send Audio Back (TTS)](#5-send-audio-back-tts)
+- [6. Make Outbound Calls](#6-make-outbound-calls)
+- [7. Call Control (Hold, Transfer, DTMF)](#7-call-control-hold-transfer-dtmf)
+- [8. Play Audio Prompts](#8-play-audio-prompts)
+- [9. Monitor with Webhooks](#9-monitor-with-webhooks)
 - [10. Production Checklist](#10-production-checklist)
 - [Migrating from Twilio](#migrating-from-twilio)
 
@@ -23,7 +25,10 @@ This guide walks you through building a complete voice agent from scratch. All e
 
 ## Architecture Overview
 
-xbridge connects your app to the phone network via two paths: cloud SIP trunks and direct PBX peering.
+xbridge connects your app to the phone network. Your app does two things:
+
+1. **Webhook handler** — receives HTTP POSTs from xbridge when calls arrive, end, etc.
+2. **WebSocket client** — connects to xbridge to send/receive real-time audio.
 
 ```
                     ┌──────────────────────────────────┐
@@ -40,57 +45,122 @@ xbridge connects your app to the phone network via two paths: cloud SIP trunks a
                     │                                    │
  ┌──────────┐      │  ┌────────────┐  ┌──────────────┐  │
  │  PBX     │◀─SIP─┤  │ Trunk Host │  │ SIP Client   │  ├─SIP──▶ ┌──────────┐
- │ Asterisk │  :5080│  │ (server)   │  │ (xphone)     │  │        │ Telnyx   │
+ │ Asterisk │  :5080│  │ (server)   │  │ (register)   │  │        │ Telnyx   │
  │ xpbx     │──SIP─▶  │            │  │              │  ◀─SIP──┤ VoIP.ms  │
  └──────────┘      │  └────────────┘  └──────────────┘  │        └──────────┘
                     └───────────────────────────────────┘
 ```
 
-Your app does two things:
-
-1. **Webhook handler** — receives HTTP POSTs from xbridge when calls arrive, end, etc.
-2. **WebSocket client** — connects to xbridge to send/receive real-time audio.
-
-Both paths (cloud trunk and PBX peer) deliver the same experience to your app — same webhooks, same WebSocket protocol, same REST API.
+All three connection modes deliver the same experience to your app — same webhooks, same WebSocket protocol, same REST API.
 
 ---
 
-## 1. Start xbridge
+## 1. Choose a Connection Mode
 
-Create `config.yaml`:
+xbridge supports three ways to connect to the phone network. Pick the one that fits your setup.
+
+### SIP Extension (register on a PBX)
+
+The simplest mode. xbridge registers on your existing PBX as an extension — just like a softphone. Calls to that extension trigger your webhooks and audio streams.
+
+**Use this when:** you have an existing PBX (Asterisk, FreePBX, 3CX, xpbx) and want to add a voice AI or IVR on a specific extension.
 
 ```yaml
-listen:
-  http: "0.0.0.0:8080"
-
 sip:
-  username: "your_sip_username"
-  password: "your_sip_password"
-  host: "sip.telnyx.com"
-  transport: "udp"
+  username: "2000"
+  password: "secret"
+  host: "192.168.1.10"       # your PBX address
+  rtp_port_min: 10000
+  rtp_port_max: 10100
 
 webhook:
   url: "http://your-app:3000"
-  timeout: "5s"
-  retry: 2
+stream:
+  encoding: "audio/x-l16"
+  sample_rate: 8000
+```
 
+This is what the [Voice AI Demo](../demo/voice-ai/) uses (via trunk host mode, but the extension approach is even simpler for a single PBX).
+
+### SIP Trunk Client (cloud provider)
+
+Register with a SIP trunk provider to get a real phone number (DID). Calls to that number trigger your webhooks.
+
+**Use this when:** you want a real phone number without running a PBX, or you're replacing Twilio.
+
+```yaml
+sip:
+  username: "your-username"
+  password: "your-password"
+  host: "sip.telnyx.com"
+  transport: "tls"
+  srtp: true
+
+webhook:
+  url: "http://your-app:3000"
 stream:
   encoding: "audio/x-mulaw"
   sample_rate: 8000
-
-auth:
-  api_key: "your-secret-key"
 ```
 
-Start with Docker:
+For multiple providers, use the `trunks` array instead of `sip`:
 
-```bash
-docker compose up -d
+```yaml
+trunks:
+  - name: "telnyx"
+    username: "1001"
+    password: "secret1"
+    host: "sip.telnyx.com"
+    transport: "tls"
+    srtp: true
+  - name: "twilio"
+    username: "2001"
+    password: "secret2"
+    host: "sip.twilio.com"
 ```
 
-Or from source:
+### SIP Trunk Host (accept calls from PBX)
+
+Run a SIP server that PBX systems connect to directly. Your PBX sends calls to xbridge over a SIP trunk.
+
+**Use this when:** you want xbridge to act as a trunk endpoint — PBX systems or cloud trunk providers send SIP INVITEs directly to it.
+
+```yaml
+server:
+  listen: "0.0.0.0:5080"
+  peers:
+    - name: "office-pbx"
+      host: "192.168.1.10"        # IP-based auth
+      codecs: ["ulaw", "alaw"]
+    - name: "remote-office"
+      auth:                       # SIP digest auth
+        username: "remote-trunk"
+        password: "secret"
+
+webhook:
+  url: "http://your-app:3000"
+stream:
+  encoding: "audio/x-l16"
+  sample_rate: 8000
+```
+
+### All three modes can run simultaneously
+
+You can register as a SIP extension, connect to a cloud trunk, and accept direct PBX connections — all in the same config file. See [`config.example.yaml`](../config.example.yaml) for all options.
+
+---
+
+## 2. Start xbridge
+
+Create `config.yaml` using one of the connection modes above, then start xbridge:
 
 ```bash
+# Docker
+docker run -v ./config.yaml:/etc/xbridge/config.yaml \
+  -p 8080:8080 -p 10000-10100:10000-10100/udp \
+  ghcr.io/x-phone/xbridge:latest
+
+# Or from source
 RUST_LOG=info cargo run --release -- --config config.yaml
 ```
 
@@ -98,14 +168,14 @@ Verify it's running:
 
 ```bash
 curl http://localhost:8080/health
-# {"status":"ok","sip_trunks":1,"active_calls":0}
+# {"status":"ok","sip_trunks":1,"sip_server":false,"active_calls":0}
 ```
 
 ---
 
-## 2. Handle Incoming Calls
+## 3. Handle Incoming Calls
 
-When someone calls your SIP number, xbridge POSTs to `{webhook_url}/incoming`. Your app decides whether to accept or reject.
+When a call arrives, xbridge POSTs to `{webhook_url}/incoming`. Your app decides whether to accept or reject.
 
 ```python
 # app.py
@@ -128,13 +198,32 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)
 ```
 
-Once you return `{"action": "accept"}`, xbridge answers the SIP call and makes audio available via WebSocket at `ws://xbridge:8080/ws/{call_id}`.
+Once you return `{"action": "accept"}`, xbridge answers the SIP call. Audio becomes available via WebSocket after the `call.answered` event fires.
+
+For calls from trunk host peers, the webhook includes a `peer` field:
+
+```python
+@app.post("/incoming")
+async def handle_incoming(call: dict):
+    peer = call.get("peer")  # "office-pbx", or None for cloud trunk / extension
+
+    if peer:
+        print(f"Call from PBX peer {peer}: {call['from']} → {call['to']}")
+    else:
+        print(f"Call from trunk: {call['from']} → {call['to']}")
+
+    return {"action": "accept", "stream": True}
+```
 
 ---
 
-## 3. Stream Audio via WebSocket
+## 4. Stream Audio via WebSocket
 
-Connect to the WebSocket to receive caller audio in real-time. The protocol is Twilio-compatible — if you've used Twilio Media Streams, this is the same format.
+Connect to the WebSocket to receive caller audio in real-time. xbridge supports two modes.
+
+### Twilio-Compatible Mode (default)
+
+JSON text frames with base64-encoded audio. Drop-in compatible with apps built for Twilio Media Streams.
 
 ```python
 import asyncio
@@ -159,7 +248,6 @@ async def handle_audio_stream(call_id: str):
             elif event["event"] == "media":
                 # Decode audio (mulaw, 8kHz, mono)
                 audio_bytes = base64.b64decode(event["media"]["payload"])
-                # Send to your AI model (STT, LLM, etc.)
                 await process_audio(audio_bytes)
 
             elif event["event"] == "dtmf":
@@ -171,29 +259,64 @@ async def handle_audio_stream(call_id: str):
                 break
 ```
 
-### Connecting After Accept
+### Native Binary Mode
 
-Update your webhook handler to start the WebSocket stream after accepting:
+Connect with `?mode=native` for lower overhead — binary frames instead of JSON/base64. After the initial JSON `connected` and `start` text frames, audio is sent as binary frames:
+
+```
+[0x01][2 bytes: length big-endian][PCM16 LE audio bytes]
+```
+
+```python
+async def handle_audio_native(call_id: str):
+    uri = f"ws://localhost:8080/ws/{call_id}?mode=native"
+    headers = {"Authorization": "Bearer your-secret-key"}
+
+    async with websockets.connect(uri, additional_headers=headers) as ws:
+        async for message in ws:
+            if isinstance(message, bytes):
+                # Binary frame: [0x01][2-byte length][PCM16 LE data]
+                if len(message) > 3 and message[0] == 0x01:
+                    length = int.from_bytes(message[1:3], "big")
+                    pcm_audio = message[3:3 + length]
+                    # pcm_audio is raw PCM16 LE, 8kHz, mono
+                    await process_audio(pcm_audio)
+            else:
+                # Text frame: JSON events (connected, start, dtmf, stop)
+                event = json.loads(message)
+                if event["event"] == "stop":
+                    break
+                elif event["event"] == "dtmf":
+                    print(f"DTMF: {event['dtmf']['digit']}")
+```
+
+Native mode is better when you're processing PCM audio directly (feeding to STT, writing to disk) since it avoids the base64 encode/decode overhead. The [Voice AI Demo](../demo/voice-ai/) uses native mode.
+
+### Starting the Pipeline on call.answered
+
+The WebSocket audio stream is available after the call is answered, not after `/incoming`. Start your audio pipeline when you receive the `call.answered` webhook event:
 
 ```python
 @app.post("/incoming")
 async def handle_incoming(call: dict):
-    call_id = call["call_id"]
+    return {"action": "accept", "stream": True}
 
-    # Accept the call
-    response = {"action": "accept", "stream": True}
+@app.post("/")
+async def handle_events(event: dict):
+    if event["event"] == "call.answered":
+        call_id = event["call_id"]
+        asyncio.create_task(handle_audio_stream(call_id))
 
-    # Start audio processing in background
-    asyncio.create_task(handle_audio_stream(call_id))
-
-    return response
+    return {"ok": True}
 ```
 
 ---
 
-## 4. Send Audio Back (TTS)
+## 5. Send Audio Back (TTS)
 
-To play audio to the caller (e.g., TTS output), send media frames back through the same WebSocket:
+To play audio to the caller (e.g., TTS output), send media frames back through the same WebSocket.
+
+### Twilio Mode
 
 ```python
 async def send_audio(ws, call_id: str, audio_bytes: bytes):
@@ -202,27 +325,33 @@ async def send_audio(ws, call_id: str, audio_bytes: bytes):
     await ws.send(json.dumps({
         "event": "media",
         "streamSid": call_id,
-        "media": {
-            "payload": payload
-        }
+        "media": {"payload": payload}
     }))
+```
+
+### Native Mode
+
+```python
+async def send_audio_native(ws, pcm_bytes: bytes):
+    """Send PCM16 audio back to the caller (native mode)."""
+    frame = bytes([0x01]) + len(pcm_bytes).to_bytes(2, "big") + pcm_bytes
+    await ws.send(frame)
 ```
 
 ### Full Duplex Example
 
-A complete bidirectional audio handler:
+A complete bidirectional audio handler (using native mode):
 
 ```python
 async def voice_agent(call_id: str):
-    uri = f"ws://localhost:8080/ws/{call_id}"
+    uri = f"ws://localhost:8080/ws/{call_id}?mode=native"
     headers = {"Authorization": "Bearer your-secret-key"}
 
     async with websockets.connect(uri, additional_headers=headers) as ws:
         async for message in ws:
-            event = json.loads(message)
-
-            if event["event"] == "media":
-                caller_audio = base64.b64decode(event["media"]["payload"])
+            if isinstance(message, bytes) and len(message) > 3 and message[0] == 0x01:
+                length = int.from_bytes(message[1:3], "big")
+                caller_audio = message[3:3 + length]
 
                 # Your AI pipeline:
                 # 1. Speech-to-text
@@ -233,14 +362,16 @@ async def voice_agent(call_id: str):
                 # 2. LLM response
                 response_text = await llm(transcript)
 
-                # 3. Text-to-speech
-                response_audio = await tts(response_text)
+                # 3. Text-to-speech (must return PCM16 LE, 8kHz, mono)
+                response_pcm = await tts(response_text)
 
                 # 4. Send audio back to caller
-                await send_audio(ws, call_id, response_audio)
+                await send_audio_native(ws, response_pcm)
 
-            elif event["event"] == "stop":
-                break
+            elif isinstance(message, str):
+                event = json.loads(message)
+                if event["event"] == "stop":
+                    break
 ```
 
 ### Using Marks for Interruption
@@ -266,7 +397,7 @@ if event["event"] == "mark":
 
 ---
 
-## 5. Make Outbound Calls
+## 6. Make Outbound Calls
 
 Initiate calls via the REST API:
 
@@ -288,32 +419,32 @@ async def make_call(to: str, from_number: str) -> dict:
 
         # data = {"call_id": "abc123", "status": "dialing", "ws_url": "ws://..."}
         print(f"Call initiated: {data['call_id']}")
-
-        # Connect to WebSocket for audio
-        asyncio.create_task(voice_agent(data["call_id"]))
-
         return data
 ```
 
-### With Multi-Trunk
-
-If you have multiple SIP providers, specify which trunk to use:
+### Via Specific Trunk or Peer
 
 ```python
+# Via a named SIP trunk
 resp = await client.post(
     f"{XBRIDGE}/v1/calls",
-    json={
-        "to": "+15551234567",
-        "from": "+15559876543",
-        "trunk": "telnyx"  # Use the "telnyx" trunk
-    },
+    json={"to": "+15551234567", "from": "+15559876543", "trunk": "telnyx"},
+    headers=HEADERS,
+)
+
+# Via a PBX peer (ring extension 1001 on the office PBX)
+resp = await client.post(
+    f"{XBRIDGE}/v1/calls",
+    json={"to": "1001", "from": "ai-agent", "peer": "office-pbx"},
     headers=HEADERS,
 )
 ```
 
+Connect to the WebSocket for audio once the `call.answered` event fires — same as inbound calls.
+
 ---
 
-## 6. Call Control (Hold, Transfer, DTMF)
+## 7. Call Control (Hold, Transfer, DTMF)
 
 All call control is done via REST API calls.
 
@@ -372,9 +503,11 @@ if event["event"] == "dtmf":
         await transfer(call_id, "sip:operator@pbx")
 ```
 
+See the **[API Reference](api-reference.md)** for full request/response schemas.
+
 ---
 
-## 7. Play Audio Prompts
+## 8. Play Audio Prompts
 
 For pre-recorded prompts or hold music, use the play endpoint instead of streaming through WebSocket:
 
@@ -421,9 +554,9 @@ async def play_pcm(call_id: str, pcm_bytes: bytes, loop_count: int = 1):
 
 ---
 
-## 8. Monitor with Webhooks
+## 9. Monitor with Webhooks
 
-xbridge sends webhook events for call lifecycle tracking. Use these for logging, analytics, or triggering actions:
+xbridge sends webhook events for call lifecycle tracking. Use these for logging, analytics, or triggering actions.
 
 ```python
 @app.post("/")
@@ -434,6 +567,7 @@ async def handle_webhook(event: dict):
 
         case "call.answered":
             print(f"Call {event['call_id']} answered")
+            # Start the audio pipeline here (see section 4)
 
         case "call.ended":
             print(f"Call {event['call_id']} ended: {event['reason']} ({event['duration']}s)")
@@ -473,153 +607,6 @@ if failures:
 
 ---
 
-## 9. Trunk Host Mode (PBX Integration)
-
-Trunk host mode lets xbridge accept SIP calls directly from PBX systems (Asterisk, FreePBX, xpbx) without a cloud trunk provider. Your PBX points a SIP trunk at xbridge, and calls flow into the same webhook + WebSocket pipeline.
-
-### Configuration
-
-Add a `server` section to your `config.yaml`:
-
-```yaml
-# Existing config (webhook, stream, auth, etc.) stays the same
-
-server:
-  listen: "0.0.0.0:5080"
-  peers:
-    # IP-based auth — accept any INVITE from this IP
-    - name: "office-pbx"
-      host: "192.168.1.10"
-      codecs: ["ulaw", "alaw"]
-
-    # Digest auth — challenge with 401, verify credentials
-    - name: "remote-office"
-      auth:
-        username: "remote-trunk"
-        password: "s3cret"
-      codecs: ["ulaw"]
-```
-
-You can use both `sip` (cloud trunk) and `server` (trunk host) simultaneously — xbridge will register with cloud providers while also accepting direct SIP from peers.
-
-### PBX Setup
-
-On your PBX, create a SIP trunk pointing at xbridge:
-
-| PBX Setting | Value |
-|---|---|
-| Trunk type | SIP (UDP) |
-| Server/Host | `xbridge-ip:5080` |
-| Authentication | IP-based (no credentials needed if peer uses `host`) or username/password |
-| Codec | ulaw or alaw |
-
-### Inbound Calls from PBX
-
-Calls from peers arrive through the same `/incoming` webhook. The `peer` field identifies which PBX the call came from:
-
-```python
-@app.post("/incoming")
-async def handle_incoming(call: dict):
-    peer = call.get("peer")  # "office-pbx", "remote-office", or None for cloud trunk
-
-    if peer == "office-pbx":
-        print(f"Call from office PBX: {call['from']} → {call['to']}")
-    elif peer:
-        print(f"Call from peer {peer}: {call['from']} → {call['to']}")
-    else:
-        print(f"Call from cloud trunk: {call['from']} → {call['to']}")
-
-    return {"action": "accept", "stream": True}
-```
-
-Everything else is identical — same WebSocket audio, same REST call control, same webhook events.
-
-### Outbound Calls to PBX Extensions
-
-Originate calls to PBX extensions using the `peer` field instead of `trunk`:
-
-```python
-# Ring extension 1001 on the office PBX
-resp = await client.post(
-    f"{XBRIDGE}/v1/calls",
-    json={
-        "to": "1001",
-        "from": "ai-agent",
-        "peer": "office-pbx"
-    },
-    headers=HEADERS,
-)
-data = resp.json()
-# {"call_id": "trunk-abc123", "status": "dialing", "ws_url": "ws://..."}
-
-# Then connect WebSocket for audio, same as any other call
-asyncio.create_task(voice_agent(data["call_id"]))
-```
-
-### Example: AI Receptionist for Office PBX
-
-A complete example — PBX forwards incoming calls to xbridge, where an AI agent handles them:
-
-```yaml
-# config.yaml
-listen:
-  http: "0.0.0.0:8080"
-
-webhook:
-  url: "http://ai-agent:3000"
-  timeout: "10s"
-  retry: 2
-
-auth:
-  api_key: "secret"
-
-server:
-  listen: "0.0.0.0:5080"
-  peers:
-    - name: "office"
-      host: "192.168.1.10"
-```
-
-```python
-# ai_receptionist.py
-from fastapi import FastAPI
-import asyncio, json, base64, websockets
-
-app = FastAPI()
-XBRIDGE = "http://localhost:8080"
-HEADERS = {"Authorization": "Bearer secret"}
-
-@app.post("/incoming")
-async def incoming(call: dict):
-    asyncio.create_task(handle_call(call["call_id"], call["from"]))
-    return {"action": "accept", "stream": True}
-
-async def handle_call(call_id: str, caller: str):
-    uri = f"ws://localhost:8080/ws/{call_id}"
-    headers = {"Authorization": "Bearer secret"}
-
-    async with websockets.connect(uri, additional_headers=headers) as ws:
-        async for message in ws:
-            event = json.loads(message)
-
-            if event["event"] == "media":
-                audio = base64.b64decode(event["media"]["payload"])
-                # Feed to STT → LLM → TTS pipeline
-                response = await ai_pipeline(audio)
-                if response:
-                    payload = base64.b64encode(response).decode()
-                    await ws.send(json.dumps({
-                        "event": "media",
-                        "streamSid": call_id,
-                        "media": {"payload": payload}
-                    }))
-
-            elif event["event"] == "stop":
-                break
-```
-
----
-
 ## 10. Production Checklist
 
 ### Security
@@ -634,8 +621,8 @@ async def handle_call(call_id: str, caller: str):
 
 - [ ] Set `webhook.retry: 3` for webhook delivery resilience
 - [ ] Monitor the DLQ endpoint (`GET /v1/webhooks/failures`) — alert if non-empty
-- [ ] Use a STUN server if behind NAT (`sip.stun_server: "stun:stun.l.google.com:19302"`)
-- [ ] Monitor `/health` — status is `"starting"` until SIP registration succeeds
+- [ ] Use a STUN server if behind NAT (`sip.stun_server: "stun.l.google.com:19302"`)
+- [ ] Monitor `/health` — status is `"starting"` until SIP registration or trunk host server is running
 
 ### Monitoring
 

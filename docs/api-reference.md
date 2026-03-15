@@ -22,7 +22,7 @@ Complete reference for the xbridge REST API, WebSocket protocol, webhook events,
   - [Delivery & Retries](#delivery--retries)
 - [Configuration](#configuration)
   - [Core](#core)
-  - [SIP Trunks](#sip-trunks)
+  - [SIP Client](#sip-client)
   - [Trunk Host (Server)](#trunk-host-server)
   - [Environment Variables](#environment-variables)
 - [Error Responses](#error-responses)
@@ -56,14 +56,16 @@ Returns server status. No authentication required.
 {
   "status": "ok",
   "sip_trunks": 1,
+  "sip_server": true,
   "active_calls": 3
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `status` | string | `"ok"` when SIP is registered, `"starting"` during initialization |
-| `sip_trunks` | integer | Number of connected SIP trunks |
+| `status` | string | `"ok"` when at least one SIP client is registered or the trunk host server is running; `"starting"` otherwise |
+| `sip_trunks` | integer | Number of connected SIP client registrations |
+| `sip_server` | boolean | `true` if the trunk host SIP server is running |
 | `active_calls` | integer | Number of calls currently in progress |
 
 #### `GET /metrics`
@@ -742,15 +744,17 @@ tls:
   key: "/path/to/key.pem"     # TLS private key. Optional.
 ```
 
-### SIP Trunks
+### SIP Client
 
-Single trunk (legacy format):
+Register with a SIP server — either a PBX (as an extension) or a cloud trunk provider (for a phone number).
+
+Single registration:
 
 ```yaml
 sip:
   username: "user"
   password: "pass"
-  host: "sip.provider.com"
+  host: "sip.provider.com"    # PBX address or trunk provider
   transport: "udp"            # "udp", "tcp", or "tls". Default: "udp"
   rtp_port_min: 0             # Minimum RTP port. 0 = OS-assigned. Default: 0
   rtp_port_max: 0             # Maximum RTP port. 0 = OS-assigned. Default: 0
@@ -758,7 +762,7 @@ sip:
   stun_server: ""             # STUN server for NAT traversal. Optional.
 ```
 
-Multiple trunks:
+Multiple registrations:
 
 ```yaml
 trunks:
@@ -766,7 +770,8 @@ trunks:
     username: "user1"
     password: "pass1"
     host: "sip.telnyx.com"
-    transport: "udp"
+    transport: "tls"
+    srtp: true
 
   - name: "voipms"
     username: "user2"
@@ -777,21 +782,32 @@ trunks:
 
 When `trunks` is set, the `sip` block is ignored. When only `sip` is set, it creates a single trunk named `"default"`.
 
+The `sip` block works identically whether the host is a cloud trunk provider (`sip.telnyx.com`) or a local PBX (`192.168.1.10`). In both cases, xbridge registers as a SIP client and receives calls via the same webhook + WebSocket pipeline.
+
 ### Trunk Host (Server)
 
-Accept SIP calls directly from PBX systems.
+Accept SIP calls directly from PBX systems or trunk providers — no registration needed.
 
 ```yaml
 server:
   listen: "0.0.0.0:5080"     # Required. SIP UDP listen address.
   rtp_port_min: 0             # Minimum RTP port. 0 = OS-assigned. Default: 0
   rtp_port_max: 0             # Maximum RTP port. 0 = OS-assigned. Default: 0
+  rtp_address: "10.200.0.20"  # IP advertised in SDP for RTP media. Required when
+                              # listening on 0.0.0.0 (e.g., in Docker). Optional.
   peers:
-    # IP-based authentication
+    # IP-based authentication (single IP)
     - name: "office-pbx"
       host: "192.168.1.10"    # Accept INVITEs from this IP without challenge.
       port: 5060              # SIP port for outbound calls to this peer. Default: 5060
       codecs: ["ulaw", "alaw"] # Allowed codecs. Empty = accept any. Default: []
+
+    # IP-based authentication (multiple IPs / CIDR ranges)
+    - name: "twilio"
+      hosts:                  # Multiple IPs or CIDR ranges.
+        - "54.172.60.0/22"
+        - "54.244.51.0/22"
+      codecs: ["ulaw"]
 
     # Digest authentication
     - name: "remote-office"
@@ -800,15 +816,38 @@ server:
         password: "s3cret"
       port: 5060
       codecs: ["ulaw"]
+      rtp_address: "203.0.113.5"  # Per-peer RTP address override. Optional.
 ```
 
+#### Server fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `listen` | string | *required* | SIP UDP listen address (e.g., `"0.0.0.0:5080"`) |
+| `rtp_port_min` | integer | `0` | Minimum RTP port. `0` = OS-assigned |
+| `rtp_port_max` | integer | `0` | Maximum RTP port. `0` = OS-assigned |
+| `rtp_address` | string | *auto* | IP advertised in SDP for RTP media. Required in Docker or when listening on `0.0.0.0` |
+| `peers` | array | `[]` | List of authorized SIP peers |
+
+#### Peer fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | *required* | Human-readable peer identifier |
+| `host` | string | — | Single IP for IP-based auth |
+| `hosts` | array | `[]` | Multiple IPs or CIDR ranges for IP-based auth (e.g., `"54.172.60.0/22"`) |
+| `port` | integer | `5060` | SIP port for outbound calls to this peer |
+| `auth` | object | — | Digest auth credentials (`username`, `password`) |
+| `codecs` | array | `[]` | Allowed codecs (e.g., `["ulaw", "alaw"]`). Empty = accept any |
+| `rtp_address` | string | — | Per-peer RTP address override (overrides server-level `rtp_address`) |
+
 **Peer authentication order:**
-1. Check source IP against peer `host` fields (fastest path)
+1. Check source IP against peer `host` and `hosts` fields (fastest path)
 2. If no IP match, check `Authorization` header against peer digest credentials
 3. If no `Authorization` header but digest-auth peers exist, respond with `401` challenge
 4. Otherwise, reject with `403`
 
-A peer can have both `host` and `auth` — IP match takes priority.
+A peer can have both `host`/`hosts` and `auth` — IP match takes priority.
 
 ### Environment Variables
 

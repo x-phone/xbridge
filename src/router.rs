@@ -171,12 +171,14 @@ async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> 
     let phones = state.phones.read().await;
     let trunk_count = phones.len();
     drop(phones);
+    let has_server = state.xphone_server.read().await.is_some();
     let active_calls = state.calls.read().await.len();
-    let status = if trunk_count > 0 { "ok" } else { "starting" };
+    let status = if trunk_count > 0 || has_server { "ok" } else { "starting" };
 
     Json(serde_json::json!({
         "status": status,
         "sip_trunks": trunk_count,
+        "sip_server": has_server,
         "active_calls": active_calls,
     }))
 }
@@ -989,6 +991,7 @@ mod tests {
         let body: serde_json::Value = body_json(resp).await;
         assert_eq!(body["status"], "starting");
         assert_eq!(body["sip_trunks"], 0);
+        assert_eq!(body["sip_server"], false);
         assert_eq!(body["active_calls"], 0);
     }
 
