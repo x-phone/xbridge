@@ -173,7 +173,11 @@ async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> 
     drop(phones);
     let has_server = state.xphone_server.read().await.is_some();
     let active_calls = state.calls.read().await.len();
-    let status = if trunk_count > 0 || has_server { "ok" } else { "starting" };
+    let status = if trunk_count > 0 || has_server {
+        "ok"
+    } else {
+        "starting"
+    };
 
     Json(serde_json::json!({
         "status": status,
