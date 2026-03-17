@@ -48,7 +48,7 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/xbridge ${{ matrix.name }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
