@@ -23,7 +23,7 @@ base64 = "0.22"
 futures-util = "0.3"
 crossbeam-channel = "0.5"
 rand = "0.9"
-axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
 
 [features]
 default = []
