@@ -4,98 +4,50 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/ghcr.io-x--phone%2Fxbridge-blue?logo=docker)](https://ghcr.io/x-phone/xbridge)
 
-**A self-hosted voice gateway that connects SIP phone calls to WebSocket audio and a REST API.**
-No Twilio. No per-minute platform fees. One binary, a YAML config, and your app gets real-time call audio over WebSocket and full call control over REST.
+A self-hosted voice gateway that connects SIP phone calls to WebSocket audio and a REST API. One binary, a YAML config, and your app gets real-time call audio over WebSocket and full call control over REST.
 
-Powered by [xphone](https://github.com/x-phone/xphone).
+Powered by [xphone-rust](https://github.com/x-phone/xphone-rust).
 
----
+## Table of Contents
 
-## Connection Modes
-
-xbridge supports three ways to connect to the phone network:
-
-1. **SIP extension** — register on any PBX (Asterisk, FreePBX, 3CX) as an extension, just like a softphone would
-2. **SIP trunk client** — register with a cloud provider (Telnyx, Twilio, VoIP.ms) to get a real phone number
-3. **SIP trunk host** — run a SIP server and accept calls directly from PBX systems or trunk providers
-
-All three modes deliver the same interface to your app — same webhooks, same WebSocket audio, same REST API. Your app speaks HTTP and WebSocket; xbridge handles all the SIP/RTP complexity.
+- [Status](#status--beta) | [Scope and Limitations](#scope-and-limitations) | [Use Cases](#use-cases)
+- [Quick Start](#quick-start) | [Demo](#demo) | [Connection Modes](#connection-modes)
+- [Configuration](#configuration) | [REST API](#rest-api) | [WebSocket Audio](#websocket-audio) | [Webhooks](#webhooks)
+- [Architecture](#architecture) | [Monitoring](#monitoring) | [Features](#features)
+- [Development](#development) | [License](#license)
 
 ---
 
-## Why xbridge?
+## Status — Beta
 
-Building a voice application that handles real phone calls usually means picking between bad tradeoffs:
-
-- **Twilio Media Streams / Vonage** — easy to start, but you're paying per-minute platform fees, your audio routes through their cloud, and you're locked into their SDK and infrastructure.
-- **Raw SIP library (xphone, PJSIP)** — full control, but now your application is a SIP application. You're managing call state, RTP ports, codec negotiation, and NAT traversal inside your business logic.
-- **Asterisk ARI / FreeSWITCH ESL** — powerful, but you're running and operating a full PBX just to bridge calls to your app. Configuration is complex and the learning curve is steep.
-
-xbridge sits in the middle: a standalone gateway that abstracts SIP/RTP into WebSocket audio frames and REST endpoints. Your app can be written in any language — Python, Node, Go, whatever speaks HTTP and WebSocket. Your audio never leaves your infrastructure unless you choose to send it somewhere.
+xbridge is in active development and used in production alongside xphone-rust. Single-node only — no built-in clustering or HA. Run multiple instances behind a load balancer for redundancy.
 
 ---
 
-## What can you build?
+## Scope and limitations
 
-### AI Voice Agents
-Connect a phone number to your LLM pipeline. Caller audio arrives over WebSocket, your app runs STT + LLM + TTS, and sends audio back. No cloud telephony SDK required.
+xbridge is a **voice data plane** — real-time SIP signaling, RTP media, and WebSocket audio streaming. It is intentionally stateless: no database, no persistent storage, no recording engine.
 
-```
-Phone call → SIP → xbridge → WebSocket audio → Your App (STT → LLM → TTS)
-                           ← WebSocket audio ←
-```
+**What xbridge is not:**
 
-### IVR Systems
-Build interactive voice menus with DTMF detection, audio playback, and call routing — all driven by your own backend via REST + webhooks.
+- **Not a full Twilio replacement.** xbridge provides Twilio-compatible WebSocket audio framing, but it does not include number provisioning, billing, CDR storage, call recording, or dashboards. Those are your application's responsibility.
+- **Audio only** — no video support. xbridge handles voice calls exclusively.
+- **Blind transfer only** — attended transfer is not available via the REST API.
+- **Narrowband audio** — WebSocket audio is 8 kHz (mu-law or PCM16). Wideband codecs (G.722, Opus) are negotiated on the SIP side but downsampled for the WebSocket stream.
+- **Single-node** — no built-in clustering or HA.
+- **SRTP uses SDES key exchange only** — DTLS-SRTP is not supported.
 
-### Call Centers
-Route incoming calls to agents via webhooks, hold/transfer/mute via REST, and tap audio for real-time transcription or quality monitoring.
-
-### Call Recording
-Connect to the WebSocket audio stream, write PCM frames to disk or S3. No recording infrastructure to manage — xbridge streams, you store.
-
-### Outbound Dialers
-Programmatically originate calls via REST API, play audio, detect DTMF responses, and hang up — classic outbound automation without IVR infrastructure.
+For production deployments that need recordings, CDR storage, billing, or dashboards, build a separate **control plane** that consumes xbridge's webhooks and WebSocket audio.
 
 ---
 
-## Self-hosted vs cloud telephony
+## Use cases
 
-| | xbridge + SIP Trunk | Twilio Media Streams |
-|---|---|---|
-| **Cost** | SIP trunk rates only (~$0.003/min) | Per-minute platform fees on top |
-| **Audio privacy** | Media stays on your infrastructure | Audio routes through Twilio's cloud |
-| **Latency** | Direct RTP to your server | Extra hop through provider media servers |
-| **Control** | Full access to raw audio, any codec | Twilio's encoding, their WebSocket protocol |
-| **Compliance** | You control data residency | Provider's data policies apply |
-| **Twilio compat** | Twilio-compatible WS protocol built in | Native |
-| **Complexity** | You deploy one binary | Managed for you |
-
-> **SIP trunk providers** (Telnyx, Twilio SIP, Vonage, Bandwidth, VoIP.ms) offer DIDs and SIP credentials at wholesale rates — typically $0.001–$0.005/min with no additional platform markup when you bring your own SIP client.
-
----
-
-## Demo
-
-A full-stack Voice AI demo is included: softphone → PBX → xbridge → AI agent with live transcription.
-
-```
-Softphone (ext 1001)
-    → Asterisk/xpbx (dial 2000)
-        → xbridge (SIP trunk host, WebSocket audio)
-            → voice-app (Deepgram STT/TTS, React UI)
-```
-
-```bash
-git clone https://github.com/x-phone/xpbx.git   # sibling directory
-cd xbridge/demo/voice-ai
-echo "EXTERNAL_IP=$(ipconfig getifaddr en0)" > .env  # macOS
-docker compose up --build
-```
-
-Open http://localhost:3000, enter a Deepgram API key, register a softphone as extension 1001 (password: `password123`) on your machine's IP port 5060, and dial 2000 to talk to the AI agent.
-
-A simpler **[SIP Trunk Demo](demo/sip-trunk/)** connects xbridge directly to Twilio or Telnyx for PSTN calls, no PBX needed.
+- **AI voice agents** — caller audio arrives over WebSocket, your app runs STT + LLM + TTS, sends audio back
+- **IVR systems** — DTMF detection, audio playback, and call routing driven by your backend via REST + webhooks
+- **Call centers** — route incoming calls via webhooks, hold/transfer/mute via REST, tap audio for transcription
+- **Call recording** — connect to the WebSocket audio stream, write frames to disk or S3
+- **Outbound dialers** — originate calls via REST API, play audio, detect DTMF responses
 
 ---
 
@@ -127,6 +79,42 @@ cargo build --release
 ```
 
 Set `RUST_LOG=info` (or `debug`, `trace`) for logging output.
+
+---
+
+## Demo
+
+A full-stack Voice AI demo is included: softphone → PBX → xbridge → AI agent with live transcription.
+
+```
+Softphone (ext 1001)
+    → Asterisk/xpbx (dial 2000)
+        → xbridge (SIP trunk host, WebSocket audio)
+            → voice-app (Deepgram STT/TTS, React UI)
+```
+
+```bash
+git clone https://github.com/x-phone/xpbx.git   # sibling directory
+cd xbridge/demo/voice-ai
+echo "EXTERNAL_IP=$(ipconfig getifaddr en0)" > .env  # macOS
+docker compose up --build
+```
+
+Open http://localhost:3000, enter a Deepgram API key, register a softphone as extension 1001 (password: `password123`) on your machine's IP port 5060, and dial 2000 to talk to the AI agent.
+
+A simpler **[SIP Trunk Demo](demo/sip-trunk/)** connects xbridge directly to Twilio or Telnyx for PSTN calls, no PBX needed.
+
+---
+
+## Connection Modes
+
+xbridge supports three ways to connect to the phone network. All three deliver the same interface to your app — same webhooks, same WebSocket audio, same REST API. Your app speaks HTTP and WebSocket; xbridge handles all the SIP/RTP complexity.
+
+1. **SIP extension** — register on any PBX (Asterisk, FreePBX, 3CX) as an extension, just like a softphone would
+2. **SIP trunk client** — register with a cloud provider (Telnyx, Twilio, VoIP.ms) to get a real phone number
+3. **SIP trunk host** — run a SIP server and accept calls directly from PBX systems or trunk providers
+
+All three modes can run simultaneously in the same configuration.
 
 ---
 
@@ -199,10 +187,6 @@ server:
 
 Peers authenticate via IP allowlist (`host`), SIP digest credentials (`auth`), or both.
 
-### All three modes can run simultaneously.
-
-You can register as a SIP extension, connect to a cloud trunk, and accept direct PBX connections — all in the same config file.
-
 ### Webhook and Stream
 
 ```yaml
@@ -274,7 +258,7 @@ See the **[API Reference](docs/api-reference.md)** for request/response schemas 
 
 Connect to `ws://host:8080/ws/{call_id}` to stream audio for a call.
 
-**Twilio-compatible mode** (default) — JSON text frames with base64-encoded audio. Drop-in compatible with apps built for Twilio Media Streams.
+**Twilio-compatible mode** (default) — JSON text frames with base64-encoded audio. Compatible with apps built for Twilio Media Streams.
 
 **Native binary mode** (`?mode=native`) — binary frames with raw PCM16 audio. Lower overhead, no JSON/base64 encoding per frame.
 
@@ -325,8 +309,6 @@ xbridge is a **data plane** — it handles real-time SIP signaling, RTP media, a
                                                └──────────────┘
 ```
 
-For production deployments that need call recordings, CDR storage, billing, or dashboards, build a separate **control plane** that consumes xbridge's webhooks and WebSocket audio. This separation keeps xbridge fast and simple while letting you build whatever persistence and business logic you need on top.
-
 ---
 
 ## Monitoring
@@ -361,57 +343,54 @@ GET /metrics
 
 ## Features
 
-| Feature | Status |
-|---|---|
-| **Connection Modes** | |
-| SIP extension (register on PBX) | Done |
-| SIP trunk client (Telnyx, Twilio, VoIP.ms, etc.) | Done |
-| SIP trunk host (accept calls from PBX systems) | Done |
-| Multi-trunk (multiple SIP providers simultaneously) | Done |
-| **Call Control** | |
-| Inbound & outbound calls | Done |
-| Hold / Resume | Done |
-| Blind transfer | Done |
-| DTMF send & receive | Done |
-| Mute / Unmute | Done |
-| Audio playback (URL or inline PCM) | Done |
-| **Audio Streaming** | |
-| Twilio-compatible WebSocket mode (JSON/base64) | Done |
-| Native binary WebSocket mode (PCM16) | Done |
-| Configurable encoding (mu-law, linear16) | Done |
-| **Peer Authentication** | |
-| IP allowlist (single IP or CIDR) | Done |
-| SIP digest auth | Done |
-| **Security** | |
-| Bearer token API authentication | Done |
-| Rate limiting | Done |
-| TLS (rustls) | Done |
-| SRTP support (via SIP trunk) | Done |
-| **Observability** | |
-| Prometheus metrics | Done |
-| Health check endpoint | Done |
-| Webhook dead letter queue | Done |
-| **Ops** | |
-| Single binary, zero dependencies | Done |
-| YAML / TOML / env var configuration | Done |
-| Docker image (amd64 + arm64) | Done |
-| Graceful shutdown (SIGTERM/SIGINT) | Done |
+### Connection modes — stable
+
+- SIP extension (register on PBX)
+- SIP trunk client (Telnyx, Twilio, VoIP.ms, etc.)
+- SIP trunk host (accept calls from PBX systems)
+- Multi-trunk (multiple SIP providers simultaneously)
+
+### Call control — stable
+
+- Inbound and outbound calls
+- Hold / resume
+- Blind transfer
+- DTMF send and receive
+- Mute / unmute
+- Audio playback (URL or inline PCM)
+
+### Audio streaming — stable
+
+- Twilio-compatible WebSocket mode (JSON/base64)
+- Native binary WebSocket mode (PCM16)
+- Configurable encoding (mu-law, linear16)
+
+### Security — stable
+
+- Bearer token API authentication
+- IP allowlist and SIP digest peer authentication
+- Rate limiting
+- TLS (rustls)
+- SRTP (via SIP trunk)
+
+### Observability — stable
+
+- Prometheus metrics
+- Health check endpoint
+- Webhook dead letter queue
+
+### Ops — stable
+
+- Single binary, zero runtime dependencies
+- YAML / TOML / env var configuration
+- Docker image (amd64 + arm64)
+- Graceful shutdown (SIGTERM/SIGINT)
 
 ---
 
 ## Integration Guide
 
 See the **[Integration Guide](docs/guide.md)** for a step-by-step walkthrough of building an AI voice agent with xbridge, including Python code examples, Twilio migration instructions, and a production checklist.
-
----
-
-## Known Limitations
-
-- **Audio only** — no video support. xbridge handles voice calls exclusively.
-- **Stateless** — no database, no CDR storage, no call recording built in. Your app handles persistence.
-- **Single-node** — no built-in clustering or HA. Run multiple instances behind a load balancer for redundancy.
-- **Blind transfer only** — attended transfer is not available via the REST API.
-- **Narrowband audio** — WebSocket audio is 8 kHz (mu-law or PCM16). Wideband codecs (G.722, Opus) are negotiated on the SIP side but downsampled for the WebSocket stream.
 
 ---
 
