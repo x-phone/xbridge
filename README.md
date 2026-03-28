@@ -6,15 +6,15 @@
 
 A self-hosted voice gateway that connects SIP phone calls to WebSocket audio and a REST API. One binary, a YAML config, and your app gets real-time call audio over WebSocket and full call control over REST.
 
-Powered by [xphone-rust](https://github.com/x-phone/xphone-rust).
+xbridge is **optional** — use it when your application is in Python, Node, or another language without a native [xphone](https://github.com/x-phone/xphone-go) library. If you're building in Go or Rust, use xphone directly instead. Powered by [xphone-rust](https://github.com/x-phone/xphone-rust).
 
 ## Table of Contents
 
 - [Status](#status--beta) | [Scope and Limitations](#scope-and-limitations) | [Use Cases](#use-cases)
 - [Quick Start](#quick-start) | [Demo](#demo) | [Connection Modes](#connection-modes)
 - [Configuration](#configuration) | [REST API](#rest-api) | [WebSocket Audio](#websocket-audio) | [Webhooks](#webhooks)
-- [Architecture](#architecture) | [Monitoring](#monitoring) | [Features](#features)
-- [Development](#development) | [License](#license)
+- [Architecture](#architecture) | [Monitoring](#monitoring) | [Features](#features) | [Tested Against](#tested-against)
+- [Roadmap](#roadmap) | [Development](#development) | [License](#license)
 
 ---
 
@@ -36,8 +36,22 @@ xbridge is a **voice data plane** — real-time SIP signaling, RTP media, and We
 - **Narrowband audio** — WebSocket audio is 8 kHz (mu-law or PCM16). Wideband codecs (G.722, Opus) are negotiated on the SIP side but downsampled for the WebSocket stream.
 - **Single-node** — no built-in clustering or HA.
 - **SRTP uses SDES key exchange only** — DTLS-SRTP is not supported.
+- **Webhook dead letter queue is in-memory only** — undelivered webhook events are lost on restart.
 
 For production deployments that need recordings, CDR storage, billing, or dashboards, build a separate **control plane** that consumes xbridge's webhooks and WebSocket audio.
+
+---
+
+## Tested against
+
+| Category | Tested with |
+|---|---|
+| **SIP trunks** | Telnyx, Twilio SIP, VoIP.ms |
+| **PBXes** | Asterisk (via [xpbx](https://github.com/x-phone/xpbx)), FreePBX, 3CX |
+| **NAT traversal** | STUN and TURN supported (configured via xphone-rust engine) |
+| **WebSocket clients** | Twilio Media Streams-compatible apps, native binary mode clients |
+
+This is not a comprehensive compatibility matrix. If you hit issues with a provider or PBX not listed here, please open an issue.
 
 ---
 
@@ -391,6 +405,16 @@ GET /metrics
 ## Integration Guide
 
 See the **[Integration Guide](docs/guide.md)** for a step-by-step walkthrough of building an AI voice agent with xbridge, including Python code examples, Twilio migration instructions, and a production checklist.
+
+---
+
+## Roadmap
+
+- DTLS-SRTP key exchange (blocked on xphone-rust support)
+- Attended transfer via REST API
+- Wideband WebSocket audio (G.722/Opus passthrough without downsampling)
+
+Clustering and HA are intentionally out of scope — xbridge is designed as a stateless single-node process. Scale horizontally by running multiple instances.
 
 ---
 
